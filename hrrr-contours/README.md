@@ -88,9 +88,17 @@ animating it. The server does as little as possible; each device contours what
 it is looking at.
 
 ```
-python3 scripts/publish_grids.py --hours 0-12 --tiles-maxzoom 6   # latest run
-npx http-server web -p 8080                                        # open /live/
+python3 scripts/publish_grids.py --var t2m  --hours 0-12   # 2 m temperature, 1 °F bands
+python3 scripts/publish_grids.py --var pwat --hours 0-12   # precipitable water, 0.1 in bands
+npx http-server web -p 8080                                # open /live/ (or /live/#pwat)
 ```
+
+**Fields** are declared in `VARIABLES` in `publish_grids.py`: the GRIB index line to
+fetch, a unit conversion, the band interval, int16 counts per band, and a colour ramp.
+Grids are stored in *band units* (value / interval), so the tiler and the browser
+contouring code never change when a field is added; the page reads colours, units,
+interval and legend ticks from the field's `meta.json`. Precipitable water publishes in
+~4.6 s per hour for z2–z6 (2 MB), since it is much smoother than temperature.
 
 **Server, per forecast hour** (`publish_grids.py`): range-fetch the 2 m temperature
 message, store it as row-delta int16 tenths of °F, gzip (~1.4 MB, ~1–2 s), then build
