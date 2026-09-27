@@ -44,8 +44,8 @@ visible colour at any point is the colour of the band floor(T) to floor(T)+1:
 
 * Gaps between bands are impossible. Every point inside the domain is covered by the
   base polygon and by each level below its temperature.
-* Each isotherm is stored once, not twice as with isobands, and the same polygons'
-  outlines are drawn as the 1° contour lines. 32 °F is drawn in white.
+* Each isotherm is stored once, not twice as with isobands. The bands are drawn
+  without outline strokes.
 * A separate, lightly simplified `labels` line layer is used only for text placement:
   every 10° at z<5.5, every 5° to z8, then every 1°.
 

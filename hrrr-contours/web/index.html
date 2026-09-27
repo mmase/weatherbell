@@ -18,7 +18,6 @@
   --water: #c9d6e0;
   --land: #e4e6e1;
   --border: rgba(18, 24, 33, 0.62);
-  --contour: rgba(20, 24, 32, 0.5);
   --label: #121821;
   --halo: rgba(255, 255, 255, 0.78);
   --ui: "Archivo", "Helvetica Neue", Arial, sans-serif;
@@ -36,7 +35,6 @@
     --water: #0c1117;
     --land: #1a1f26;
     --border: rgba(10, 12, 16, 0.75);
-    --contour: rgba(12, 14, 20, 0.55);
     --label: #0d1117;
     --halo: rgba(255, 255, 255, 0.7);
   }
@@ -52,7 +50,6 @@
   --water: #0c1117;
   --land: #1a1f26;
   --border: rgba(10, 12, 16, 0.75);
-  --contour: rgba(12, 14, 20, 0.55);
   --label: #0d1117;
   --halo: rgba(255, 255, 255, 0.7);
 }
@@ -139,11 +136,10 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
     <div id="sub">Hover or tap<br>the map</div>
   </div>
   <div class="toggles">
-    <button class="chip" id="t-lines" aria-pressed="true">Isotherms</button>
     <button class="chip" id="t-labels" aria-pressed="true">Labels</button>
     <button class="chip" id="t-borders" aria-pressed="true">Borders</button>
   </div>
-  <div class="credit">Vector contours every 1&nbsp;°F. Data: NOAA/NCEP HRRR via <a href="https://registry.opendata.aws/noaa-hrrr-pds/" target="_blank" rel="noopener">AWS Open Data</a>. Boundaries: Natural Earth, US Census.</div>
+  <div class="credit">Vector bands every 1&nbsp;°F. Data: NOAA/NCEP HRRR via <a href="https://registry.opendata.aws/noaa-hrrr-pds/" target="_blank" rel="noopener">AWS Open Data</a>. Boundaries: Natural Earth, US Census.</div>
 </section>
 
 <div id="zoom"><button id="zin" aria-label="Zoom in">+</button><button id="zout" aria-label="Zoom out">−</button></div>
@@ -231,7 +227,6 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
   const v = css();
   const abs = (p) => new URL(p, location.href).href;
   const zw = (pairs) => ["interpolate", ["exponential", 1.6], ["zoom"], ...pairs.flat()];
-  const major = ["==", ["%", ["get", "t"], 10], 0];
   const labelLayer = (id, minzoom, maxzoom, filter) => ({
     id, type: "symbol", source: "t2m", "source-layer": "labels", minzoom, maxzoom, filter,
     layout: {
@@ -261,14 +256,6 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
         // Stacked superlevel sets: the base footprint, then {T >= t} for ascending t.
         { id: "base", type: "fill", source: "t2m", "source-layer": "base", paint: { "fill-color": colorExpr, "fill-antialias": false } },
         { id: "levels", type: "fill", source: "t2m", "source-layer": "levels", paint: { "fill-color": colorExpr, "fill-antialias": true } },
-        { id: "iso", type: "line", source: "t2m", "source-layer": "levels", filter: ["!=", ["get", "t"], 32],
-          layout: { "line-join": "round", "line-cap": "round" },
-          paint: { "line-color": v("--contour"),
-                   "line-width": zw([[3, ["case", major, 0.45, 0.18]], [7, ["case", major, 0.9, 0.45]], [12, ["case", major, 1.8, 1.0]]]),
-                   "line-opacity": ["interpolate", ["linear"], ["zoom"], 3, 0.55, 7, 0.8, 12, 0.9] } },
-        { id: "freezing", type: "line", source: "t2m", "source-layer": "levels", filter: ["==", ["get", "t"], 32],
-          layout: { "line-join": "round", "line-cap": "round" },
-          paint: { "line-color": "#ffffff", "line-width": zw([[3, 0.9], [7, 1.6], [12, 3]]), "line-opacity": 0.95 } },
         { id: "coast", type: "line", source: "geo", filter: ["in", ["get", "kind"], ["literal", ["coast", "country"]]],
           paint: { "line-color": v("--border"), "line-width": zw([[3, 0.7], [8, 1.4], [12, 2]]) } },
         { id: "state", type: "line", source: "geo", filter: ["==", ["get", "kind"], "state"],
@@ -285,7 +272,6 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
     const v = css();
     map.setPaintProperty("bg", "background-color", v("--water"));
     map.setPaintProperty("land", "fill-color", v("--land"));
-    map.setPaintProperty("iso", "line-color", v("--contour"));
     for (const id of ["coast", "state"]) map.setPaintProperty(id, "line-color", v("--border"));
     for (const id of ["lab10", "lab5", "lab1"]) { map.setPaintProperty(id, "text-color", v("--label")); map.setPaintProperty(id, "text-halo-color", v("--halo")); }
     document.body.style.background = v("--water");
@@ -342,7 +328,7 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
   document.getElementById("zin").onclick = () => map.zoomIn();
   document.getElementById("zout").onclick = () => map.zoomOut();
 
-  const toggles = { "t-lines": ["iso", "freezing"], "t-labels": ["lab10", "lab5", "lab1"], "t-borders": ["coast", "state"] };
+  const toggles = { "t-labels": ["lab10", "lab5", "lab1"], "t-borders": ["coast", "state"] };
   for (const [id, layers] of Object.entries(toggles)) {
     const b = document.getElementById(id);
     b.onclick = () => {
