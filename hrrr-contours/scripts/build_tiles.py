@@ -7,13 +7,13 @@ Pipeline (per tile, per zoom):
      that zoom (1/16 of a 3 km cell at z9, 8 cells at z2).  The lattice is
      global, so neighbouring tiles share identical lattice points.
   2. Evaluate the field on the lattice window covering the tile:
-       - upsampling (spacing < 1 cell): separable Keys bicubic convolution.
-         It is C1-continuous, so contours come out as smooth curves instead of
-         the kinked polylines you get from contouring the raw 3 km grid, and
-         it is strictly local (4x4 support) so every tile computes bit-identical
-         values for shared lattice points -> contours match across tile seams.
-       - at low zooms the lattice is the native grid itself (never coarser),
-         so every model feature is kept.
+       - spacing <= 1 cell: separable uniform cubic B-spline.  It is
+         C2-continuous and approximating, so contours come out as smooth,
+         rounded curves (no diamonds or grid-aligned edges from grid-scale
+         noise), and it is strictly local (4x4 support) so every tile computes
+         bit-identical values for shared lattice points -> contours match
+         across tile seams.  The browser uses the same kernel.
+       - at low zooms the lattice is never coarser than the native grid.
   3. contourpy computes, for every integer degree t, the superlevel polygon
      {T >= t} (layer "levels", plus the data footprint in "base").  Painted in
      ascending t, these stack into 1-degree bands that cannot have gaps, and
@@ -105,20 +105,16 @@ class WebMercator:
                 self.R * np.log(np.tan(np.pi / 4 + np.radians(np.asarray(lat)) / 2)))
 
 
-def keys_weights(u, n):
-    """Keys (a=-0.5) cubic convolution weights for sample positions u (in cells).
+def cubic_weights(u, n):
+    """Uniform cubic B-spline weights for sample positions u (in cells).
 
     Returns (W, first) where W[k, :] are weights over padded-grid columns
     first..first+W.shape[1]-1 (the grid is padded by 2 on each side).
     """
     base = np.floor(u).astype(np.int64)
     t = u - base
-    a = -0.5
-    def k1(x):  # |x| <= 1
-        return (a + 2) * x**3 - (a + 3) * x**2 + 1
-    def k2(x):  # 1 < |x| < 2
-        return a * x**3 - 5 * a * x**2 + 8 * a * x - 4 * a
-    w = np.stack([k2(1 + t), k1(t), k1(1 - t), k2(2 - t)], axis=1)
+    v = 1 - t
+    w = np.stack([v**3, 3 * t**3 - 6 * t**2 + 4, -3 * t**3 + 3 * t**2 + 3 * t + 1, t**3], axis=1) / 6
     first = base.min() - 1
     width = base.max() + 3 - first
     W = np.zeros((len(u), width))
@@ -142,6 +138,7 @@ def load_grid(path):
         proj = (f"+proj=lcc +lon_0={p['lon0']} +lat_0={p['lat0']} +lat_1={p['lat1']} +lat_2={p['lat2']} "
                 f"+R={p['R']}")
         Field.cell_m = meta["dx"]
+    Field.wrap = bool(meta.get("global"))
     return q.astype(np.float64) / meta["scale"], proj, meta["x0"], meta["y0"], meta["dx"]
 
 
@@ -151,10 +148,14 @@ class Field:
         self.F, self.proj, self.x0, self.y0, self.dx = load(path)
         self.ny, self.nx = self.F.shape
         self.Fp = np.pad(self.F, 2, mode="edge")
+        if self.wrap:  # global: the last column repeats the first, so neighbours wrap across it
+            self.Fp[:, :2] = np.pad(self.F[:, -3:-1], ((2, 2), (0, 0)), mode="edge")
+            self.Fp[:, -2:] = np.pad(self.F[:, 1:3], ((2, 2), (0, 0)), mode="edge")
         self.to_merc = WebMercator(self.proj, inverse=False)
         self.to_lcc = WebMercator(self.proj, inverse=True)
 
     cell_m = 3000.0  # nominal grid cell size in metres (set per source)
+    wrap = False     # global grid (columns wrap; set per source)
 
     def spacing(self, z):
         # ~1.6 px per lattice step at every zoom, never coarser than the grid
@@ -172,12 +173,12 @@ class Field:
         if len(ni) < 2 or len(nj) < 2:
             return None
         ui, uj = ni * s, nj * s
-        if s < 1:
-            Wx, fx = keys_weights(ui, self.nx)
-            Wy, fy = keys_weights(uj, self.ny)
+        if s <= 1:
+            Wx, fx = cubic_weights(ui, self.nx)
+            Wy, fy = cubic_weights(uj, self.ny)
             sub = self.Fp[fy:fy + Wy.shape[1], fx:fx + Wx.shape[1]]
             Z = Wy @ sub @ Wx.T
-        else:  # exactly the native grid: use the model values as-is
+        else:  # coarser than the grid (not used by the tiler's spacing rule)
             Z = self.F[np.ix_(nj, ni)]
         X = self.x0 + ui * self.dx
         Y = self.y0 + uj * self.dx

@@ -99,14 +99,18 @@ export class Grid {
   }
 }
 
-// Keys (a = -0.5) cubic convolution weights
-function keys(t, out, o) {
-  const a = -0.5, t2 = t * t, t3 = t2 * t;
-  const u = 1 + t, v = 1 - t, w = 2 - t;
-  out[o] = a * u * u * u - 5 * a * u * u + 8 * a * u - 4 * a;
-  out[o + 1] = (a + 2) * t3 - (a + 3) * t2 + 1;
-  out[o + 2] = (a + 2) * v * v * v - (a + 3) * v * v + 1;
-  out[o + 3] = a * w * w * w - 5 * a * w * w + 8 * a * w - 4 * a;
+// Cubic kernel weights over nodes b-1..b+2 for a sample at b + t.
+// Uniform cubic B-spline: C2-continuous and approximating (it does not pass
+// through the node values), so grid-scale noise and single-cell spikes don't
+// turn into diamond- or square-shaped contours; broad features are unchanged
+// (at a node it is the 1-4-1 / 6 average of its neighbours).  The server tiler
+// uses the same kernel, so tiles and device contours match at the switch zoom.
+function bspline(t, out, o) {
+  const t2 = t * t, t3 = t2 * t, v = 1 - t;
+  out[o] = v * v * v / 6;
+  out[o + 1] = (3 * t3 - 6 * t2 + 4) / 6;
+  out[o + 2] = (-3 * t3 + 3 * t2 + 3 * t + 1) / 6;
+  out[o + 3] = t3 / 6;
 }
 
 // growable typed arrays
@@ -149,7 +153,7 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
   const val = new Float32Array(np);
   const A = fields[0], B = fields[1];
   const wa = B ? 1 - w : 1, wb = B ? w : 0;
-  if (s >= 1) { // native grid values (s > 1: every s-th node, animation only)
+  if (s > 1 || grid.k > 1) { // every s-th full-grid node as-is (zoomed out / animation; the spline's smoothing is sub-pixel there)
     for (let r = 0; r < lh; r++) {
       const row = (nj0 + r) * s * nx;
       for (let c = 0; c < lw; c++) {
@@ -158,11 +162,11 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
       }
     }
   } else {
-    // separable bicubic: weights per lattice column/row, clamped at the edges
+    // separable cubic B-spline: weights per lattice column/row, clamped at the edges
     const cw = new Float64Array(lw * 4), cb = new Int32Array(lw);
-    for (let c = 0; c < lw; c++) { const u = (ni0 + c) * s, b = Math.floor(u); cb[c] = b; keys(u - b, cw, c * 4); }
+    for (let c = 0; c < lw; c++) { const u = (ni0 + c) * s, b = Math.floor(u); cb[c] = b; bspline(u - b, cw, c * 4); }
     const rw = new Float64Array(lh * 4), rb = new Int32Array(lh);
-    for (let r = 0; r < lh; r++) { const u = (nj0 + r) * s, b = Math.floor(u); rb[r] = b; keys(u - b, rw, r * 4); }
+    for (let r = 0; r < lh; r++) { const u = (nj0 + r) * s, b = Math.floor(u); rb[r] = b; bspline(u - b, rw, r * 4); }
     const gr0 = Math.max(0, rb[0] - 1), gr1 = Math.min(ny - 1, rb[lh - 1] + 2);
     const hr = new Float64Array((gr1 - gr0 + 1) * lw); // rows interpolated horizontally
     for (let g = gr0; g <= gr1; g++) {
@@ -355,12 +359,13 @@ export function sample(grid, fields, w, lon, lat) {
   if (u < 0 || v < 0 || u > nx - 1 || v > ny - 1) return null;
   const A = fields[0], B = fields[1];
   const bi = Math.floor(u), bj = Math.floor(v), wx = new Float64Array(4), wy = new Float64Array(4);
-  keys(u - bi, wx, 0); keys(v - bj, wy, 0);
+  bspline(u - bi, wx, 0); bspline(v - bj, wy, 0);
+  const PER = grid.period, col = (c) => (PER ? ((c % PER) + PER) % PER : Math.min(nx - 1, Math.max(0, c)));
   let acc = 0;
   for (let r = 0; r < 4; r++) {
     const jj = Math.min(ny - 1, Math.max(0, bj - 1 + r));
     for (let c = 0; c < 4; c++) {
-      const g = jj * nx + Math.min(nx - 1, Math.max(0, bi - 1 + c));
+      const g = jj * nx + col(bi - 1 + c);
       acc += wy[r] * wx[c] * (B ? A[g] * (1 - w) + B[g] * w : A[g]);
     }
   }
