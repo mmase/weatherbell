@@ -44,8 +44,13 @@ from pyproj import Transformer
 EXTENT = 8192
 BUFFER = 96  # tile units of overlap beyond the tile edge
 MINZOOM, MAXZOOM = 2, 9
-LABEL_ALL_ZOOM = 7
-LABEL_TOLERANCE = 40  # tile units (~2.5 px) for the label-only line layer  # from this zoom every 1-degree isoline gets a label line
+LABEL_ALL_ZOOM = 7  # from this zoom every 1-degree isoline gets a label line
+LABEL_TOLERANCE = 40  # tile units (~2.5 px) for the label-only line layer
+# Fill simplification, in screen px at the tile's own zoom.  Levels are stacked
+# (see below), so each polygon can be simplified independently without opening
+# gaps; rings are never removed (topology-preserving), only thinned.  The top
+# zoom is overzoomed up to 16x, so its tolerance is set in overzoomed px.
+SIMPLIFY_PX = 0.3
 ORIGIN = 20037508.342789244
 
 # --------------------------------------------------------------------------- field
@@ -171,7 +176,15 @@ def varint_bytes(vals):
 
 
 def varint(n):
-    return varint_bytes([n])
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
 
 
 def field_bytes(num, wt, payload):
@@ -181,25 +194,6 @@ def field_bytes(num, wt, payload):
 def zigzag(a):
     a = a.astype(np.int64)
     return ((a << 1) ^ (a >> 63)).astype(np.uint64)
-
-
-def encode_geometry(parts, polygon):
-    """parts: list of int coordinate arrays (n,2).  Returns packed uint32 bytes."""
-    cmds = []
-    cursor = np.zeros(2, dtype=np.int64)
-    for p in parts:
-        d = np.diff(np.vstack([cursor, p]), axis=0)
-        cursor = p[-1]
-        zz = zigzag(d)
-        seq = np.empty(2 + 2 * len(p) + (1 if polygon else 0), dtype=np.uint64)
-        seq[0] = 9  # MoveTo(1)
-        seq[1:3] = zz[0]
-        seq[3] = 2 | ((len(p) - 1) << 3)  # LineTo(n-1)
-        seq[4:4 + 2 * (len(p) - 1)] = zz[1:].ravel()
-        if polygon:
-            seq[-1] = 15  # ClosePath
-        cmds.append(seq)
-    return varint_bytes(np.concatenate(cmds))
 
 
 def encode_layer(name, features, extent=EXTENT):
@@ -223,58 +217,134 @@ def encode_layer(name, features, extent=EXTENT):
 # --------------------------------------------------------------------------- tile building
 
 
-def dedupe(c):
-    keep = np.ones(len(c), dtype=bool)
-    keep[1:] = np.any(c[1:] != c[:-1], axis=1)
-    return c[keep]
+def encode_rings(coords, ring_off, groups, polygon):
+    """Vectorised MVT geometry encoding for many features at once.
 
-
-def ring_area2(c):
-    x, y = c[:, 0], c[:, 1]
-    return float(np.dot(x, np.roll(y, -1)) - np.dot(np.roll(x, -1), y))
-
-
-def polys_to_parts(geom):
-    """Clipped (Multi)Polygon in tile coords -> list of quantised MVT rings."""
-    parts = []
-    if geom is None or geom.is_empty:
-        return parts
-    gtype, coords, offsets = shapely.to_ragged_array([geom])
-    ring_off, poly_off = offsets[0], offsets[1]
+    coords: (n, 2) float tile coordinates; ring_off: ring start offsets into
+    coords (len nrings + 1); groups: ring offsets per output feature
+    (len nfeatures + 1).  Polygons additionally need the exterior flag per ring
+    (passed via polygon=(is_exterior array)).  Rings are quantised, closing and
+    consecutive duplicate points dropped, degenerate rings removed (a polygon
+    whose exterior degenerates is removed with its holes), orientation fixed to
+    the MVT winding rule, then encoded with commands and zigzag deltas.
+    Returns a list of packed-geometry bytes (b"" for empty features).
+    """
     q = np.round(coords).astype(np.int64)
-    for p in range(len(poly_off) - 1):
-        for r_i, r in enumerate(range(poly_off[p], poly_off[p + 1])):
-            c = dedupe(q[ring_off[r]:ring_off[r + 1] - 1])  # drop closing point
-            if len(c) >= 2 and np.all(c[0] == c[-1]):
-                c = c[:-1]
-            if len(c) < 3:
-                if r_i == 0:
-                    break  # degenerate exterior: drop polygon
-                continue
-            a = ring_area2(c)
-            if a == 0:
-                if r_i == 0:
-                    break
-                continue
-            # MVT: exterior positive area, interior negative (y-down coordinates)
-            if (r_i == 0) != (a > 0):
-                c = c[::-1]
-            parts.append(c)
-    return parts
+    nring = len(ring_off) - 1
+    counts = np.diff(ring_off)
+    rid = np.repeat(np.arange(nring), counts)
+    keep = np.ones(len(q), dtype=bool)
+    if polygon is not None:
+        keep[ring_off[1:][counts > 0] - 1] = False  # closing point
+    same = np.zeros(len(q), dtype=bool)
+    same[1:] = (rid[1:] == rid[:-1]) & np.all(q[1:] == q[:-1], axis=1)
+    keep &= ~same
+    idx = np.nonzero(keep)[0]
+    rid_k = rid[idx]
+    n = np.bincount(rid_k, minlength=nring)
+    start = np.concatenate([[0], np.cumsum(n)[:-1]])
+    pts = q[idx]
+    if polygon is not None:
+        # quantisation can make the last kept point equal the first
+        last = start + n - 1
+        dup = (n > 1) & np.all(pts[np.maximum(last, 0)] == pts[start], axis=1)
+        drop = np.zeros(len(pts), dtype=bool)
+        drop[last[dup]] = True
+        pts, rid_k = pts[~drop], rid_k[~drop]
+        n = np.bincount(rid_k, minlength=nring)
+        start = np.concatenate([[0], np.cumsum(n)[:-1]])
+        # signed area (x2) per ring
+        nxt = np.arange(len(pts)) + 1
+        ends = start + n
+        nxt[ends[n > 0] - 1] = start[n > 0]
+        cross = pts[:, 0] * pts[nxt, 1] - pts[nxt, 0] * pts[:, 1]
+        area = np.bincount(rid_k, weights=cross, minlength=nring)
+        is_ext = polygon
+        valid = (n >= 3) & (area != 0)
+        # a hole survives only if its polygon's exterior does
+        poly_id = np.cumsum(is_ext) - 1
+        ext_ok = valid[is_ext]
+        valid &= ext_ok[poly_id]
+        rev = valid & (is_ext != (area > 0))
+    else:
+        valid = n >= 2
+        rev = np.zeros(nring, dtype=bool)
+    # final point order per kept ring (reversed where needed)
+    kept = valid[rid_k]
+    pos = np.arange(len(pts)) - start[rid_k]
+    newpos = np.where(rev[rid_k], n[rid_k] - 1 - pos, pos)
+    order = (start[rid_k] + newpos)[kept]
+    pts, rid_k = pts[order], rid_k[kept]
+    n = np.where(valid, n, 0)
+    # feature id per ring / point; deltas restart at 0 for each feature
+    feat_of_ring = np.repeat(np.arange(len(groups) - 1), np.diff(groups))
+    fid = feat_of_ring[rid_k]
+    d = np.diff(pts, axis=0, prepend=[[0, 0]])
+    first_of_feat = np.ones(len(pts), dtype=bool)
+    first_of_feat[1:] = fid[1:] != fid[:-1]
+    d[first_of_feat] = pts[first_of_feat]
+    zz = ((d << 1) ^ (d >> 63)).astype(np.uint64)
+    # command stream: MoveTo(1) x y LineTo(n-1) ... [ClosePath]
+    extra = 3 if polygon is not None else 2
+    per = np.where(n > 0, 2 * n + extra, 0)
+    rs = np.concatenate([[0], np.cumsum(per)[:-1]])
+    out = np.empty(int(per.sum()), dtype=np.uint64)
+    live = n > 0
+    out[rs[live]] = 9
+    out[rs[live] + 3] = 2 | ((n[live] - 1) << 3)
+    if polygon is not None:
+        out[rs[live] + per[live] - 1] = 15
+    p = np.arange(len(pts)) - np.concatenate([[0], np.cumsum(n)[:-1]])[rid_k]
+    base = rs[rid_k] + np.where(p == 0, 1, 2 + 2 * p)
+    out[base] = zz[:, 0]
+    out[base + 1] = zz[:, 1]
+    # varint-encode once, then slice per feature
+    nb = np.ones(len(out), dtype=np.int64)
+    for k in range(1, 10):
+        nb += out >= (np.uint64(1) << np.uint64(7 * k))
+    blob = varint_bytes(out)
+    ring_bytes = np.bincount(np.repeat(np.arange(nring), per), weights=nb[:], minlength=nring) if len(out) else np.zeros(nring)
+    fb = np.concatenate([[0], np.cumsum(np.bincount(feat_of_ring, weights=ring_bytes, minlength=len(groups) - 1))]).astype(np.int64)
+    return [blob[fb[i]:fb[i + 1]] for i in range(len(groups) - 1)]
 
 
-def lines_to_parts(geom):
-    parts = []
-    if geom is None or geom.is_empty:
-        return parts
-    gtype, coords, offsets = shapely.to_ragged_array([geom])
-    line_off = offsets[0]
-    q = np.round(coords).astype(np.int64)
-    for l in range(len(line_off) - 1):
-        c = dedupe(q[line_off[l]:line_off[l + 1]])
-        if len(c) >= 2:
-            parts.append(c)
-    return parts
+def simplify_rings(coords, ring_off, tol):
+    """Douglas-Peucker each ring independently (vectorised in GEOS).
+
+    Rings that would collapse (fewer than 4 coordinates) keep their original
+    shape, so no feature is ever removed -- only redundant vertices are.
+    """
+    rings = shapely.from_ragged_array(shapely.GeometryType.LINESTRING, coords, (ring_off,))
+    simp = shapely.simplify(rings, tol, preserve_topology=False)
+    ok = shapely.get_num_coordinates(simp) >= 4
+    simp = np.where(ok, simp, rings)
+    _, c, (off,) = shapely.to_ragged_array(simp)
+    return c, off
+
+
+def ragged(geoms, kind):
+    """Array of (Multi)Polygons or (Multi)LineStrings -> coords, ring offsets,
+    per-geometry ring offsets and (polygons) the exterior flag per ring."""
+    single = shapely.GeometryType.POLYGON if kind == "polygon" else shapely.GeometryType.LINESTRING
+    multi = shapely.MultiPolygon if kind == "polygon" else shapely.MultiLineString
+    norm = []
+    for g in geoms:
+        if g is None or g.is_empty:
+            norm.append(multi())
+            continue
+        parts = shapely.get_parts(g)
+        parts = parts[shapely.get_type_id(parts) == single]
+        norm.append(multi(list(parts)) if len(parts) else multi())
+    if all(g.is_empty for g in norm):
+        return None
+    _, coords, offs = shapely.to_ragged_array(norm)
+    if kind == "polygon":
+        ring_off, poly_off, geom_off = offs
+        is_ext = np.zeros(len(ring_off) - 1, dtype=bool)
+        is_ext[poly_off[:-1][np.diff(poly_off) > 0]] = True
+        return coords, ring_off, poly_off[geom_off], is_ext
+    line_off, geom_off = offs
+    return coords, line_off, geom_off, None
 
 
 FIELD = None
@@ -309,46 +379,65 @@ def build_tile(zxy):
     if lat is None:
         return zxy, None
     X, Y, Z = lat
-    gen = contourpy.contour_generator(X, Y, Z, fill_type="OuterOffset", line_type="Separate")
+    gen = contourpy.contour_generator(X, Y, Z, fill_type="ChunkCombinedOffsetOffset",
+                                      line_type="ChunkCombinedOffset")
     scale = EXTENT / size
-
-    def to_tile(pts):
-        mx, my = fld.to_merc.transform(pts[:, 0], pts[:, 1])
-        return np.column_stack([(np.asarray(mx) - minx) * scale, (maxy - np.asarray(my)) * scale])
-
     lo, hi = int(math.floor(Z.min())), int(math.floor(Z.max()))
-    rect = (-BUFFER, -BUFFER, EXTENT + BUFFER, EXTENT + BUFFER)
     top = float(Z.max()) + 1.0
-    levels, labels = [], []
+
+    # Superlevel set {T >= t} for every integer t.  Painted in ascending t the
+    # visible colour of any point is floor(T), and the ring boundaries are
+    # exactly the t-degree isolines (each isoline is stored once).  The t == lo
+    # polygon is the data footprint, so the stack covers the domain with no gaps.
+    fills, lines = [], []
     for t in range(lo, hi + 1):
-        # Superlevel set {T >= t}.  Painted in ascending t, the visible colour of
-        # any point is floor(T), and the ring boundaries are exactly the t-degree
-        # isolines (each isoline is stored once).  The t == lo polygon is simply
-        # the data footprint, so the stack covers the domain with no gaps.
-        pts_list, offs_list = gen.filled(t, top)
-        polys = []
-        for pts, offs in zip(pts_list, offs_list):
-            tp = to_tile(pts)
-            rings = [tp[offs[k]:offs[k + 1]] for k in range(len(offs) - 1)]
-            polys.append(shapely.Polygon(rings[0], rings[1:]))
-        if polys:
-            g = shapely.clip_by_rect(shapely.MultiPolygon(polys) if len(polys) > 1 else polys[0], *rect)
-            parts = polys_to_parts(g)
-            if parts:
-                levels.append((t, 3, encode_geometry(parts, True)))
-        # Open/closed isolines for text labels only (every 5 deg at low zoom).
+        pts, offs, outer = (c[0] for c in gen.filled(t, top))
+        if pts is not None:
+            fills.append((t, pts, offs, outer))
+        # Isolines for text placement only (every 5 deg at low zoom).
         if t > lo and (t % 5 == 0 or z >= LABEL_ALL_ZOOM):
-            segs = [to_tile(l) for l in gen.lines(t) if len(l) >= 2]
-            if segs:
-                # Label paths only: simplify so MapLibre's max-angle test accepts
-                # them (fills/strokes come from the unsimplified polygons).
-                g = shapely.clip_by_rect(shapely.MultiLineString(segs), *rect).simplify(LABEL_TOLERANCE)
-                parts = lines_to_parts(g)
-                if parts:
-                    labels.append((t, 2, encode_geometry(parts, False)))
+            lp, lo_ = (c[0] for c in gen.lines(t))
+            if lp is not None:
+                lines.append((t, lp, lo_))
+    if not fills:
+        return zxy, None
+
+    # one reprojection call for every vertex in the tile
+    allpts = np.concatenate([f[1] for f in fills] + [l[1] for l in lines])
+    mx, my = fld.to_merc.transform(allpts[:, 0], allpts[:, 1])
+    tp = np.column_stack([(mx - minx) * scale, (maxy - my) * scale])
+    k = 0
+    polys, mls = [], []
+    for t, pts, offs, outer in fills:
+        c = tp[k:k + len(pts)]; k += len(pts)
+        polys.append(shapely.from_ragged_array(
+            shapely.GeometryType.MULTIPOLYGON, c, (offs, outer, np.array([0, len(outer) - 1])))[0])
+    for t, lp, lo_ in lines:
+        c = tp[k:k + len(lp)]; k += len(lp)
+        mls.append(shapely.from_ragged_array(
+            shapely.GeometryType.MULTILINESTRING, c, (lo_, np.array([0, len(lo_) - 1])))[0])
+
+    rect = (-BUFFER, -BUFFER, EXTENT + BUFFER, EXTENT + BUFFER)
+    px = EXTENT / 512 / (16 if z == MAXZOOM else 1)
+    tol = max(0.5, SIMPLIFY_PX * px)
+    r = ragged(shapely.clip_by_rect(np.array(polys), *rect), "polygon")
+    if r is None:
+        return zxy, None
+    coords, ring_off = simplify_rings(r[0], r[1], tol)
+    geoms = encode_rings(coords, ring_off, r[2], r[3])
+    levels = [(f[0], 3, g) for f, g in zip(fills, geoms) if g]
+    labels = []
+    if mls:
+        mls = shapely.simplify(shapely.clip_by_rect(np.array(mls), *rect), LABEL_TOLERANCE)
+        r = ragged(mls, "line")
+        if r is not None:
+            geoms = encode_rings(r[0], r[1], r[2], None)
+            labels = [(l[0], 2, g) for l, g in zip(lines, geoms) if g]
     if not levels:
         return zxy, None
-    pbf = encode_layer("base", levels[:1]) + encode_layer("levels", levels[1:]) if len(levels) > 1 else encode_layer("base", levels)
+    pbf = encode_layer("base", levels[:1])
+    if len(levels) > 1:
+        pbf += encode_layer("levels", levels[1:])
     if labels:
         pbf += encode_layer("labels", labels)
     return zxy, gzip.compress(pbf, 6, mtime=0)
@@ -379,7 +468,9 @@ def main(grib="data/hrrr_t2m.grib2", out="web/tiles"):
     t0 = time.time()
     fld = Field(grib)
     jobs = [t for z in range(MINZOOM, MAXZOOM + 1) for t in domain_tiles(fld, z)]
-    jobs.sort(key=lambda t: -t[0])  # big low-zoom tiles last keeps the pool busy
+    # Longest jobs first (low zooms are the heaviest tiles) so no straggler is
+    # left running alone at the end.
+    jobs.sort(key=lambda t: t[0])
     packs = {}
     nbytes = 0
     with Pool(os.cpu_count(), initializer=init_worker, initargs=(grib,)) as pool:

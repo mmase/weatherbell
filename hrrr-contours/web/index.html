@@ -191,7 +191,10 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
     const r = z <= 6 ? 5 : 7;
     return `${r}-${x >> (z - r)}-${y >> (z - r)}`;
   };
-  const packs = new Map(); // key -> Promise<{buf, index}>, LRU by insertion order
+  // key -> Promise<{buf, index}>, least recently used first; capped by bytes so
+  // long sessions don't grow without bound (MapLibre keeps its own tile cache).
+  const packs = new Map(), packBytes = new Map(), PACK_BUDGET = 48e6;
+  let cached = 0;
   function getPack(key) {
     let p = packs.get(key);
     if (p) { packs.delete(key); packs.set(key, p); return p; }
@@ -200,11 +203,17 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
       for (let i = 0, o = 4; i < n; i++, o += 20)
         index.set(`${dv.getUint32(o, true)}/${dv.getUint32(o + 4, true)}/${dv.getUint32(o + 8, true)}`,
                   [dv.getUint32(o + 12, true), dv.getUint32(o + 16, true)]);
+      if (packs.get(key) === p) {
+        packBytes.set(key, buf.byteLength); cached += buf.byteLength;
+        for (const k of packs.keys()) {
+          if (cached <= PACK_BUDGET || k === key) break;
+          cached -= packBytes.get(k) || 0; packBytes.delete(k); packs.delete(k);
+        }
+      }
       return { buf, index };
     });
     p.catch(() => packs.delete(key));
     packs.set(key, p);
-    while (packs.size > 48) packs.delete(packs.keys().next().value);
     return p;
   }
   maplibregl.addProtocol("hrrr", async (params) => {
@@ -236,6 +245,9 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
     paint: { "text-color": v("--label"), "text-halo-color": v("--halo"), "text-halo-width": 1.4, "text-halo-blur": 0.4 },
   });
 
+  const lo = Math.floor(meta.tmin), levelIds = [];
+  for (let t = lo; t <= Math.ceil(meta.tmax); t++) levelIds.push(`lvl${t}`);
+
   const map = new maplibregl.Map({
     container: "map",
     center: [-97.5, 38.6], zoom: window.innerWidth < 600 ? 2.6 : 3.9, minZoom: 2, maxZoom: 13,
@@ -253,7 +265,14 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
         { id: "land", type: "fill", source: "geo", filter: ["==", ["get", "kind"], "land"], paint: { "fill-color": v("--land") } },
         // Stacked superlevel sets: the base footprint, then {T >= t} for ascending t.
         { id: "base", type: "fill", source: "t2m", "source-layer": "base", paint: { "fill-color": colorExpr, "fill-antialias": false } },
-        { id: "levels", type: "fill", source: "t2m", "source-layer": "levels", paint: { "fill-color": colorExpr, "fill-antialias": true } },
+        // One layer per degree with a constant colour.  MapLibre draws constant
+        // opaque fills in its opaque pass, top layer first with depth writes, so
+        // the GPU rejects the hidden lower levels instead of painting every
+        // pixel once per degree below it (a data-driven colour forces blending).
+        ...levelIds.map((id, i) => ({
+          id, type: "fill", source: "t2m", "source-layer": "levels", filter: ["==", ["get", "t"], lo + i],
+          paint: { "fill-color": ["interpolate-lab", ["linear"], lo + i + 0.5, ...STOPS.flat()], "fill-antialias": true },
+        })),
         { id: "coast", type: "line", source: "geo", filter: ["in", ["get", "kind"], ["literal", ["coast", "country"]]],
           paint: { "line-color": v("--border"), "line-width": zw([[3, 0.7], [8, 1.4], [12, 2]]) } },
         { id: "state", type: "line", source: "geo", filter: ["==", ["get", "kind"], "state"],
@@ -286,25 +305,25 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
   document.getElementById("range").textContent = `${meta.tmin}° to ${meta.tmax}°`;
 
   // legend
-  const lo = Math.floor(meta.tmin / 10) * 10 - 0, hi = Math.ceil(meta.tmax / 10) * 10;
+  const lgLo = Math.floor(meta.tmin / 10) * 10, lgHi = Math.ceil(meta.tmax / 10) * 10;
   const bc = document.getElementById("barc"), bctx = bc.getContext("2d");
-  bc.width = (hi - lo); // one pixel per degree: the bar shows the 1° bands themselves
-  for (let t = lo; t < hi; t++) { const [r, g, b] = colorAt(t + 0.5); bctx.fillStyle = `rgb(${r},${g},${b})`; bctx.fillRect(t - lo, 0, 1, 1); }
+  bc.width = (lgHi - lgLo); // one pixel per degree: the bar shows the 1° bands themselves
+  for (let t = lgLo; t < lgHi; t++) { const [r, g, b] = colorAt(t + 0.5); bctx.fillStyle = `rgb(${r},${g},${b})`; bctx.fillRect(t - lgLo, 0, 1, 1); }
   bc.style.imageRendering = "pixelated";
   const ticks = document.getElementById("ticks");
-  const pos = (t) => `${((t - lo) / (hi - lo)) * 100}%`;
-  for (let t = lo; t <= hi; t += 10) {
+  const pos = (t) => `${((t - lgLo) / (lgHi - lgLo)) * 100}%`;
+  for (let t = lgLo; t <= lgHi; t += 10) {
     const s = document.createElement("span"); s.style.left = pos(t); s.textContent = t; ticks.append(s);
   }
-  if (32 > lo && 32 < hi) { const s = document.createElement("span"); s.className = "frz"; s.style.left = pos(32); s.textContent = "32"; s.style.top = "0"; ticks.append(s); }
+  if (32 > lgLo && 32 < lgHi) { const s = document.createElement("span"); s.className = "frz"; s.style.left = pos(32); s.textContent = "32"; s.style.top = "0"; ticks.append(s); }
   // keep the 32 tick from colliding with 30
-  [...ticks.children].forEach((s) => { if (+s.textContent === 30 && s.className !== "frz" && 32 > lo && 32 < hi) s.style.visibility = "hidden"; });
+  [...ticks.children].forEach((s) => { if (+s.textContent === 30 && s.className !== "frz" && 32 > lgLo && 32 < lgHi) s.style.visibility = "hidden"; });
 
   // readout: the band at a point is the highest superlevel polygon that contains it
   const val = document.getElementById("val"), sub = document.getElementById("sub"), cur = document.getElementById("cursor");
   let pending = null;
   function readout(pt, lngLat) {
-    const fs = map.queryRenderedFeatures(pt, { layers: ["base", "levels"] });
+    const fs = map.queryRenderedFeatures(pt, { layers: ["base", ...levelIds] });
     if (!fs.length) {
       val.innerHTML = "––<small>°F</small>"; sub.innerHTML = "Outside the<br>HRRR domain"; cur.style.display = "none"; return;
     }
