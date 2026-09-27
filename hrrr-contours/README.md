@@ -23,13 +23,19 @@ npx http-server web -p 8080        # any static server works
 
 HRRR is a 3 km Lambert grid. Contouring it directly gives kinked polylines with a
 vertex every 3 km. Instead, each tile evaluates the field on a finer **global
-lattice** in grid-index space using separable Keys bicubic convolution, then contours
+lattice** in grid-index space using a separable uniform cubic B-spline, then contours
 that lattice with `contourpy`:
 
 * The lattice step is about 1.6 screen px from z5 up (1 cell at z5, 1/16 cell at z8,
   and 1/32 cell, ~94 m, at z9, which MapLibre overzooms up to z13). It is never coarser
   than the native 3 km grid, so z2–z4 carry every model feature too.
-* Bicubic convolution is C¹-continuous, so the isotherms are tangent-continuous curves.
+* The cubic B-spline is C²-continuous and approximating: it does not pass exactly
+  through the grid values, so grid-scale noise and single-cell spikes don't show up as
+  diamond- or square-shaped contours. Isotherms come out as rounded, curvature-
+  continuous curves. Broad features are unchanged; a lone one-cell spike keeps ~44% of
+  its height (at a node the spline is the 1-4-1 / 6 average of its neighbours in each
+  direction). This replaced Keys cubic convolution (interpolating, C¹), which drew
+  grid noise faithfully and looked blocky zoomed in.
 * The kernel is local (4×4), and the lattice is global, so neighbouring tiles compute
   bit-identical values in their overlap. Contours meet exactly at tile seams.
 
@@ -110,7 +116,7 @@ their `.idx` appears, so in production this hangs off NOAA's new-object notifica
 * z2–z6: the server tiles, one constant-colour MapLibre fill layer per degree.
 * z7 and up: a WebGL2 custom layer. A pool of module workers contours each visible
   tile from the grid with the same lattice rule as the server (never coarser than the
-  native grid, Keys bicubic below it). Each lattice cell is split into two triangles
+  native grid, cubic B-spline at and below it). Each lattice cell is split into two triangles
   and each triangle is cut into 1° slabs (convex, so each piece is a fan). The output
   is triangles directly, so there is no polygon assembly or earcut step. Boundary
   points on a shared edge are computed from the edge's endpoints in a fixed order, so
@@ -122,7 +128,7 @@ their `.idx` appears, so in production this hangs off NOAA's new-object notifica
   the two neighbouring forecast hours are blended before contouring, so bands morph
   between hours. A new frame is requested only after the previous one has been
   drawn, so slower devices show fewer in-between frames instead of falling behind.
-* The readout samples the grid (bicubic), so it shows the actual value, e.g. 62.4 °F.
+* The readout samples the same B-spline surface the bands are cut from, e.g. 62.4 °F.
 
 Measured in this repo's container (Node / headless Chromium, 4 vCPU):
 
@@ -168,7 +174,7 @@ product. Gaussian latitudes are within 1% of evenly spaced, so rows are resample
 | device, one z7 tile | 12 ms, 2.2 MB GPU | 4 ms, 0.9 MB GPU |
 
 Device contouring is not the bottleneck: the lattice spacing is set in screen pixels,
-so a finer grid only replaces the bicubic upsampling the 0.25° grid needed. The costs
+so a finer grid only replaces the cubic upsampling the 0.25° grid needed. The costs
 that grow with resolution are download and memory, handled by:
 
 * **A grid pyramid.** Each hour is also published at every 2nd, 4th and 8th node
