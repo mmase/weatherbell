@@ -19,25 +19,24 @@ npx http-server web -p 8080        # any static server works
 | Basemap | `scripts/build_boundaries.mjs` | Land, coast, country and state lines from Natural Earth / US Census via `world-atlas` and `us-atlas`. |
 | Map | `web/index.html` | MapLibre GL JS. Tiles come through a custom `hrrr://` protocol that reads them from pack files. |
 
-### Smoothness
+### Smoothness (storm's algorithm)
 
-HRRR is a 3 km Lambert grid. Contouring it directly gives kinked polylines with a
-vertex every 3 km. Instead, each tile evaluates the field on a finer **global
-lattice** in grid-index space using a separable uniform cubic B-spline, then contours
-that lattice with `contourpy`:
+Contours are traced on the model grid as it is (raw values, linear crossings), and
+then every contour ring is smoothed as a curve. This is the ring smoothing from
+`mmase/storm` (`app/assets/javascripts/maps/gui/smooth.js`):
 
-* The lattice step is about 1.6 screen px from z5 up (1 cell at z5, 1/16 cell at z8,
-  and 1/32 cell, ~94 m, at z9, which MapLibre overzooms up to z13). It is never coarser
-  than the native 3 km grid, so z2–z4 carry every model feature too.
-* The cubic B-spline is C²-continuous and approximating: it does not pass exactly
-  through the grid values, so grid-scale noise and single-cell spikes don't show up as
-  diamond- or square-shaped contours. Isotherms come out as rounded, curvature-
-  continuous curves. Broad features are unchanged; a lone one-cell spike keeps ~44% of
-  its height (at a node the spline is the 1-4-1 / 6 average of its neighbours in each
-  direction). This replaced Keys cubic convolution (interpolating, C¹), which drew
-  grid noise faithfully and looked blocky zoomed in.
-* The kernel is local (4×4), and the lattice is global, so neighbouring tiles compute
-  bit-identical values in their overlap. Contours meet exactly at tile seams.
+* Each ring is replaced by the uniform cubic B-spline of its vertices. For each segment
+  p1 → p2 the curve is evaluated from p0..p3 with storm's basis
+  `k0 = (1-t)³/6, k1 = (3t³-6t²+4)/6, k2 = (-3t³+3t²+3t+1)/6, k3 = t³/6`,
+  one point every ~1.5 screen px (storm used a fixed 0.005 rad; here the step follows
+  the zoom, so curves stay smooth when zoomed in).
+* The curve is C² and approximates the vertices, so the kinks of the raw 3 km contour
+  and single-cell diamonds become rounded curves; like storm, rings shrink slightly at
+  sharp corners, and nested contours are smoothed independently.
+* Tiles: each tile contours a window of the grid 4 cells beyond its edge. Vertices on
+  the window border are kept exactly (rings close along it); the spline near them
+  stays outside the tile, so neighbouring tiles produce identical curves where they
+  meet (checked pixel by pixel).
 
 Nothing is simplified or dropped from the fill geometry at any zoom.
 
@@ -115,20 +114,26 @@ their `.idx` appears, so in production this hangs off NOAA's new-object notifica
 
 * z2–z6: the server tiles, one constant-colour MapLibre fill layer per degree.
 * z7 and up: a WebGL2 custom layer. A pool of module workers contours each visible
-  tile from the grid with the same lattice rule as the server (never coarser than the
-  native grid, cubic B-spline at and below it). Each lattice cell is split into two triangles
-  and each triangle is cut into 1° slabs (convex, so each piece is a fan). The output
-  is triangles directly, so there is no polygon assembly or earcut step. Boundary
-  points on a shared edge are computed from the edge's endpoints in a fixed order, so
-  neighbours meet exactly. Uniform areas are merged with a quadtree whose blocks keep
-  every perimeter vertex (no T-junction cracks). Bands use WebGL2 `flat` shading, and
-  the palette is shared with the tile layers so there is no colour jump at z7. There
-  is no zoom cap.
+  tile the same way as the server: marching squares on the raw grid nodes traces the
+  rings of every 1° superlevel set (the window is closed by a border below every
+  level, so every ring closes), and each ring gets storm's B-spline smoothing in
+  screen space (points within one spline segment thinned to 1/8 of the lattice
+  spacing). The rings are nested (each ring's parent is the smallest ring around it)
+  and every band is filled once with earcut: a ring minus its children, in the band
+  just inside it (t around a warm region, t − 1 in a hole). Parent and child share the
+  same ring, so bands meet exactly. Rings along the window border are nudged outward
+  per level (outside the tile) so a parent never shares edges with its child, which
+  keeps earcut on its fast path. Each tile is masked to its square with the stencil
+  buffer (a 16 × 16 grid, so neighbouring masks meet exactly on the globe, like
+  MapLibre's own tile masks); the triangulation is conforming, so long triangles are
+  fine on the globe.
+  Bands use WebGL2 `flat` shading, and the palette is shared with the tile layers so
+  there is no colour jump at z7. There is no zoom cap.
 * Playback: every zoom switches to the WebGL layer with a coarser lattice (4 px), and
   the two neighbouring forecast hours are blended before contouring, so bands morph
   between hours. A new frame is requested only after the previous one has been
   drawn, so slower devices show fewer in-between frames instead of falling behind.
-* The readout samples the same B-spline surface the bands are cut from, e.g. 62.4 °F.
+* The readout interpolates the grid bilinearly (what the rings are traced from), e.g. 62.4 °F.
 
 Measured in this repo's container (Node / headless Chromium, 4 vCPU):
 
@@ -136,8 +141,9 @@ Measured in this repo's container (Node / headless Chromium, 4 vCPU):
 |---|---|
 | Publish one hour (grid) | 1–2 s |
 | Publish one hour (grid + z2–z6 tiles) | ~13 s |
-| Worker time per tile, z12 / z8 / z4 during playback | 11 / 31 / 58 ms |
-| GPU data per tile at z9 / z12 | ~5 / ~3 MB |
+| Worker time per tile, HRRR z12 / z9 / z7 | 3 / 11 / 100 ms |
+| Worker time per tile during playback (6 px lattice), HRRR z4 / T1534 z1 | 95–190 / 60–200 ms |
+| GPU data per tile at z7 / z9 / z12 | ~2.3 / ~0.3 / <0.1 MB |
 
 **Global models (GFS)** are published on the 0.25° lat/lon grid cropped to ±85.25°
 (one row past web mercator), with the −180° column repeated at +180° so the field

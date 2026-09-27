@@ -3,22 +3,18 @@
 
 Pipeline (per tile, per zoom):
 
-  1. Pick a lattice in HRRR grid-index space whose spacing is ~1.5 screen px at
-     that zoom (1/16 of a 3 km cell at z9, 8 cells at z2).  The lattice is
-     global, so neighbouring tiles share identical lattice points.
-  2. Evaluate the field on the lattice window covering the tile:
-       - spacing <= 1 cell: separable uniform cubic B-spline.  It is
-         C2-continuous and approximating, so contours come out as smooth,
-         rounded curves (no diamonds or grid-aligned edges from grid-scale
-         noise), and it is strictly local (4x4 support) so every tile computes
-         bit-identical values for shared lattice points -> contours match
-         across tile seams.  The browser uses the same kernel.
-       - at low zooms the lattice is never coarser than the native grid.
-  3. contourpy computes, for every integer degree t, the superlevel polygon
+  1. Take the model grid itself (the raw values, no interpolation) in a window
+     around the tile, with a margin of 4 cells.
+  2. contourpy computes, for every integer degree t, the superlevel polygon
      {T >= t} (layer "levels", plus the data footprint in "base").  Painted in
      ascending t, these stack into 1-degree bands that cannot have gaps, and
      their outlines are the isotherms.  A lightly simplified copy of the
      isolines (layer "labels") is used only for text placement.
+  3. Storm's smoothing (mmase/storm, maps/gui/smooth.js): every ring is replaced
+     by the uniform cubic B-spline through its vertices, sampled every ~1.5 px.
+     Points on the window border are kept exactly (rings close along it), and
+     that border is outside the buffered tile, so neighbouring tiles match.
+     The browser does the same for zooms above the tiles.
   4. Reproject LCC -> Web Mercator, clip to the buffered tile, quantise to a
      8192 extent and encode Mapbox Vector Tile protobuf directly (no
      simplification of fills, no feature dropping -- every contour at every zoom).
@@ -61,6 +57,7 @@ LABEL_TOLERANCE = 40  # tile units (~2.5 px) for the label-only line layer
 # gaps; rings are never removed (topology-preserving), only thinned.  The top
 # zoom is overzoomed up to 16x, so its tolerance is set in overzoomed px.
 SIMPLIFY_PX = 0.3
+SMOOTH_PX = 1.5  # storm smoothing: one point per this many screen px along each ring
 ORIGIN = 20037508.342789244
 
 # --------------------------------------------------------------------------- field
@@ -158,12 +155,9 @@ class Field:
     wrap = False     # global grid (columns wrap; set per source)
 
     def spacing(self, z):
-        # ~1.6 px per lattice step at every zoom, never coarser than the grid
-        # (so no model feature is smoothed away at low zooms); the top zoom is
-        # twice as dense because MapLibre overzooms it up to z13.
-        mpp = 40075016.686 * math.cos(math.radians(38.5)) / (512 * 2 ** z)
-        s = min(1.0, 2.0 ** round(math.log2(1.6 * mpp / self.cell_m)))
-        return s / 2 if z == TOPZOOM else s
+        # the raw grid at every zoom: contours are traced on the model's own
+        # nodes and smoothed as curves afterwards (storm's algorithm)
+        return 1.0
 
     def lattice(self, z, i0, i1, j0, j1):
         """Field values on the global lattice restricted to grid-index box."""
@@ -173,7 +167,7 @@ class Field:
         if len(ni) < 2 or len(nj) < 2:
             return None
         ui, uj = ni * s, nj * s
-        if s <= 1:
+        if s < 1:
             Wx, fx = cubic_weights(ui, self.nx)
             Wy, fy = cubic_weights(uj, self.ny)
             sub = self.Fp[fy:fy + Wy.shape[1], fx:fx + Wx.shape[1]]
@@ -354,6 +348,63 @@ def simplify_rings(coords, ring_off, tol):
     return c, off
 
 
+def bspline_weights(t):
+    """Uniform cubic B-spline basis at t (storm's k0..k3), shape (len(t), 4)."""
+    v = 1 - t
+    return np.stack([v**3, 3 * t**3 - 6 * t**2 + 4, -3 * t**3 + 3 * t**2 + 3 * t + 1, t**3], axis=1) / 6
+
+
+def smooth_rings(c, pin, offs, closed, delta):
+    """Storm's ring smoothing, vectorised over every ring of a tile.
+
+    c: (N, 2) points; ring k is c[offs[k]:offs[k+1]] (a closed ring repeats its
+    first point at the end).  For each segment p1 -> p2 the uniform cubic B-spline
+    of p0..p3 is sampled every `delta`.  Pinned points (window border; ends of open
+    lines) are kept exactly: segments touching them stay straight, and a spline
+    next to one uses a mirrored phantom point so it starts/ends on it.  Rings under
+    4 points are kept as they are.  Returns (points, offsets).
+    """
+    offs = np.asarray(offs, np.int64)
+    lens = np.diff(offs)
+    m = np.where(closed, lens - 1, lens)                  # distinct points per ring
+    tot = int(m.sum())
+    if tot == 0:
+        return c, offs
+    ring = np.repeat(np.arange(len(m)), m)
+    local = np.arange(tot) - np.repeat(np.cumsum(m) - m, m)
+    mm, st, cl = m[ring], offs[:-1][ring], closed[ring]
+    pinx = pin.copy()
+    op = ~closed & (m > 0)
+    pinx[offs[:-1][op]] = True                              # open lines: both ends fixed
+    pinx[(offs[:-1] + m - 1)[op]] = True
+
+    def nb(d):
+        l_ = local + d
+        return st + np.where(cl, l_ % np.maximum(mm, 1), np.clip(l_, 0, mm - 1))
+    i1, i0, i2, i3 = st + local, nb(-1), nb(1), nb(2)
+    p0, p1, p2, p3 = c[i0], c[i1], c[i2], c[i3]
+    linear = pinx[i1] | pinx[i2] | (m[ring] < 4) | (~cl & (local == mm - 1))
+    p0 = np.where(pinx[i0][:, None], 2 * p1 - p2, p0)
+    p3 = np.where(pinx[i3][:, None], 2 * p2 - p1, p3)
+    n = np.where(linear, 1, np.maximum(1, np.ceil(np.hypot(*(p2 - p1).T) / delta))).astype(np.int64)
+    rep = np.repeat(np.arange(tot), n)
+    t = (np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)) / n[rep]
+    W = bspline_weights(t)
+    out = (W[:, :1] * p0[rep] + W[:, 1:2] * p1[rep] + W[:, 2:3] * p2[rep] + W[:, 3:] * p3[rep])
+    out = np.where(linear[rep][:, None], p1[rep], out)
+    # per-ring counts; closed rings repeat their first point
+    cnt = np.bincount(ring[rep], minlength=len(m))
+    first = np.concatenate([[0], np.cumsum(cnt)[:-1]])
+    new_cnt = cnt + closed.astype(np.int64)
+    new_offs = np.concatenate([[0], np.cumsum(new_cnt)])
+    res = np.empty((int(new_offs[-1]), 2))
+    dest = np.arange(len(out)) + np.repeat(new_offs[:-1] - first, cnt)
+    res[dest] = out
+    cr = np.nonzero(closed & (cnt > 0))[0]
+    res[new_offs[1:][cr] - 1] = out[first[cr]]
+    return res, new_offs
+
+
 def drop_short_rings(offs, outer):
     """Remove rings with < 4 points (a polygon whose exterior is short goes too)."""
     n = np.diff(offs)
@@ -426,7 +477,7 @@ def build_tile(zxy):
     lx, ly = fld.to_lcc.transform(bx, by)
     gi, gj = (np.array(lx) - fld.x0) / fld.dx, (np.array(ly) - fld.y0) / fld.dx
     s = fld.spacing(z)
-    pad = 2 * s
+    pad = 4 * s  # the smoothing near the (fixed) window border stays outside the tile
     if MIN_BAND is not None:
         # nothing visible here? (checked on the raw grid, with room for bicubic overshoot)
         r0, r1 = max(0, int(gj.min() - 3)), min(fld.ny, int(gj.max() + 4))
@@ -470,25 +521,34 @@ def build_tile(zxy):
     allpts = np.concatenate([f[1] for f in fills] + [l[1] for l in lines])
     mx, my = fld.to_merc.transform(allpts[:, 0], allpts[:, 1])
     tp = np.column_stack([(mx - minx) * scale, (maxy - my) * scale])
+    # vertices on the lattice window border stay fixed when smoothing
+    tol = 1e-6 * fld.dx
+    onb = ((np.abs(allpts[:, 0] - X[0]) < tol) | (np.abs(allpts[:, 0] - X[-1]) < tol) |
+           (np.abs(allpts[:, 1] - Y[0]) < tol) | (np.abs(allpts[:, 1] - Y[-1]) < tol))
+    px = EXTENT / 512 / (16 if z == TOPZOOM else 1)
+    delta = SMOOTH_PX * px
     k = 0
     polys, mls = [], []
     for t, pts, offs, outer in fills:
-        c = tp[k:k + len(pts)]; k += len(pts)
+        c, pn = tp[k:k + len(pts)], onb[k:k + len(pts)]; k += len(pts)
         r = drop_short_rings(offs, outer)
         if len(r) == 3:
             offs, outer, idx = r
-            c = c[idx]
+            c, pn = c[idx], pn[idx]
         if len(outer) < 2:
             continue
+        c, offs = smooth_rings(c, pn, offs, np.ones(len(offs) - 1, bool), delta)
         polys.append(shapely.from_ragged_array(
             shapely.GeometryType.MULTIPOLYGON, c, (offs, outer, np.array([0, len(outer) - 1])))[0])
     for t, lp, lo_ in lines:
-        c = tp[k:k + len(lp)]; k += len(lp)
+        c, pn = tp[k:k + len(lp)], onb[k:k + len(lp)]; k += len(lp)
+        first, last = lo_[:-1], lo_[1:] - 1
+        closed = np.all(c[first] == c[last], axis=1)
+        c, lo_ = smooth_rings(c, pn, lo_, closed, delta)
         mls.append(shapely.from_ragged_array(
             shapely.GeometryType.MULTILINESTRING, c, (lo_, np.array([0, len(lo_) - 1])))[0])
 
     rect = (-BUFFER, -BUFFER, EXTENT + BUFFER, EXTENT + BUFFER)
-    px = EXTENT / 512 / (16 if z == TOPZOOM else 1)
     tol = max(0.5, SIMPLIFY_PX * px)
     r = ragged(shapely.clip_by_rect(np.array(polys), *rect), "polygon")
     if r is None:

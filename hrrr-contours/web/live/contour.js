@@ -1,20 +1,28 @@
 // Client-side vector contouring of a model grid into GPU-ready triangles.
 //
-// For one web-mercator tile this
-//   1. picks a lattice in model-grid index space whose step is ~spacingPx
-//      screen pixels (never coarser than the native grid).  The lattice is
-//      global for a zoom level, so neighbouring tiles share lattice points;
-//   2. evaluates the field there: native values when the step is one cell,
-//      otherwise Keys bicubic convolution (C1-smooth, local 4x4 support, so
-//      every tile computes identical values for shared points);
-//   3. splits each lattice cell into two triangles and cuts each triangle into
-//      1-degree bands (triangle ∩ slab is convex, so each piece is a fan).
-//      Boundary points on a shared edge are always computed from the edge's
-//      endpoints in the same order, so neighbouring triangles meet exactly:
-//      no gaps, no overlaps, no triangulation library.
+// Storm's algorithm (mmase/storm, app/assets/javascripts/maps/gui/smooth.js):
+// contour the model grid as-is, then smooth every contour ring with a uniform
+// cubic B-spline, adding points along it.  For one web-mercator tile this
+//   1. takes the grid nodes around the tile (every s-th node when zoomed out /
+//      playing; the raw values, no interpolation), plus a margin;
+//   2. traces the ring(s) of every 1-degree superlevel set {T >= t} with
+//      marching squares (linear crossings; the window is closed by a border
+//      treated as below every level, so every ring is closed);
+//   3. smooths each ring with storm's B-spline (same basis, same segment
+//      scheme) in screen space, one point every ~spacingPx pixels.  Points on
+//      the window border stay fixed, so rings still close along it; that
+//      border lies outside the tile, so neighbours match inside it;
+//   4. nests the rings (each ring's parent is the smallest ring around it) and
+//      fills every band once: a ring minus its children, with earcut, in the
+//      band just inside the ring (t around a warm region, t - 1 in a hole); the
+//      window minus the outermost rings is the lowest band.  Rings are shared
+//      by parent and child, so neighbouring bands meet exactly: no gaps;
+//   5. drops the triangles outside the tile.  The renderer masks each tile to
+//      its own square with the stencil buffer (the triangulation is conforming,
+//      so long triangles are fine on the globe too).
 // Output: vertex positions (tile-local, 0..1), a band per vertex, and a
-// triangle index list whose last vertex carries the triangle's band (WebGL2
-// flat shading uses the last "provoking" vertex).
+// triangle index list (WebGL2 flat shading; every vertex of a band carries it).
+import earcut from "./earcut.js";
 
 const WORLD = 40075016.68557849; // web mercator world width in metres
 const D2R = Math.PI / 180;
@@ -95,16 +103,12 @@ export class Grid {
     const mPerPx = WORLD * Math.cos(this.meta.proj.lat0 * D2R) / (512 * 2 ** z);
     // in nodes of the full-resolution grid, then in this level's nodes
     const s = 2 ** Math.round(Math.log2(spacingPx * mPerPx / (this.cellM / this.k)));
-    return Math.min(allowCoarse ? 8 : 1, s) / this.k;
+    return Math.min(allowCoarse ? 16 : 1, s) / this.k; // playback: up to every 16th node
   }
 }
 
-// Cubic kernel weights over nodes b-1..b+2 for a sample at b + t.
-// Uniform cubic B-spline: C2-continuous and approximating (it does not pass
-// through the node values), so grid-scale noise and single-cell spikes don't
-// turn into diamond- or square-shaped contours; broad features are unchanged
-// (at a node it is the 1-4-1 / 6 average of its neighbours).  The server tiler
-// uses the same kernel, so tiles and device contours match at the switch zoom.
+// Uniform cubic B-spline basis for a point at t along the segment p1 -> p2 of
+// control points p0..p3 (storm's k0..k3).
 function bspline(t, out, o) {
   const t2 = t * t, t3 = t2 * t, v = 1 - t;
   out[o] = v * v * v / 6;
@@ -125,10 +129,9 @@ class Buf {
  * fields: [Int16Array] or [Int16Array, Int16Array] (values = degF * scale);
  * w: blend weight toward the second field (morphing between forecast hours).
  */
-export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse = false) {
+export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse = false, globe = false) {
   const { nx, ny } = grid, scale = grid.meta.scale;
   const tz = 2 ** z, tx0 = x / tz, ty0 = y / tz, ts = 1 / tz;
-  const margin = ts / 64;
   // grid window covering the tile (sample its edges; mercator -> lon/lat -> ij)
   let i0 = Infinity, i1 = -Infinity, j0 = Infinity, j1 = -Infinity;
   for (let k = 0; k <= 16; k++) {
@@ -138,8 +141,10 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
       if (i < i0) i0 = i; if (i > i1) i1 = i; if (j < j0) j0 = j; if (j > j1) j1 = j;
     }
   }
-  const s = grid.step(z, spacingPx, allowCoarse);
-  const pad = 2 * s + 0.1 / grid.k; // in this level's nodes; the same window at every pyramid level
+  const s = Math.max(1, grid.step(z, spacingPx, allowCoarse)); // raw nodes, never interpolated
+  // margin beyond the tile, in this level's nodes: the smoothing near the fixed
+  // window border (2 nodes) stays outside the tile (same window at every pyramid level)
+  const pad = 4 * s + Math.max(i1 - i0, j1 - j0) * TILE_OVERLAP + 0.1 / grid.k; // + the drawn overlap
   const PER = grid.period; // global: columns wrap, so the window may run past either end
   const ni0 = PER ? Math.ceil((i0 - pad) / s) : Math.max(0, Math.ceil((i0 - pad) / s));
   const ni1 = PER ? Math.floor((i1 + pad) / s) : Math.min(Math.floor((nx - 1) / s), Math.floor((i1 + pad) / s));
@@ -149,226 +154,334 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
   if (lw < 2 || lh < 2) return null;
   const np = lw * lh;
 
-  // ---- field values on the lattice
-  const val = new Float32Array(np);
+  // ---- node values (band units) and tile-local positions
+  const val = new Float64Array(np);
   const A = fields[0], B = fields[1];
   const wa = B ? 1 - w : 1, wb = B ? w : 0;
-  if (s > 1 || grid.k > 1) { // every s-th full-grid node as-is (zoomed out / animation; the spline's smoothing is sub-pixel there)
-    for (let r = 0; r < lh; r++) {
-      const row = (nj0 + r) * s * nx;
-      for (let c = 0; c < lw; c++) {
-        const g = row + wrapCol((ni0 + c) * s);
-        val[r * lw + c] = (B ? A[g] * wa + B[g] * wb : A[g]) / scale;
-      }
-    }
-  } else {
-    // separable cubic B-spline: weights per lattice column/row, clamped at the edges
-    const cw = new Float64Array(lw * 4), cb = new Int32Array(lw);
-    for (let c = 0; c < lw; c++) { const u = (ni0 + c) * s, b = Math.floor(u); cb[c] = b; bspline(u - b, cw, c * 4); }
-    const rw = new Float64Array(lh * 4), rb = new Int32Array(lh);
-    for (let r = 0; r < lh; r++) { const u = (nj0 + r) * s, b = Math.floor(u); rb[r] = b; bspline(u - b, rw, r * 4); }
-    const gr0 = Math.max(0, rb[0] - 1), gr1 = Math.min(ny - 1, rb[lh - 1] + 2);
-    const hr = new Float64Array((gr1 - gr0 + 1) * lw); // rows interpolated horizontally
-    for (let g = gr0; g <= gr1; g++) {
-      const row = g * nx, o = (g - gr0) * lw;
-      for (let c = 0; c < lw; c++) {
-        let acc = 0; const b = cb[c], k = c * 4;
-        for (let t = 0; t < 4; t++) {
-          const gi = row + wrapCol(b - 1 + t);
-          acc += cw[k + t] * (B ? A[gi] * wa + B[gi] * wb : A[gi]);
-        }
-        hr[o + c] = acc;
-      }
-    }
-    for (let r = 0; r < lh; r++) {
-      const b = rb[r], k = r * 4;
-      for (let c = 0; c < lw; c++) {
-        let acc = 0;
-        for (let t = 0; t < 4; t++) {
-          const jj = Math.min(gr1, Math.max(gr0, b - 1 + t));
-          acc += rw[k + t] * hr[(jj - gr0) * lw + c];
-        }
-        val[r * lw + c] = acc / scale;
-      }
+  let vmin = Infinity, vmax = -Infinity;
+  for (let r = 0; r < lh; r++) {
+    const row = (nj0 + r) * s * nx;
+    for (let c = 0; c < lw; c++) {
+      const g = row + wrapCol((ni0 + c) * s);
+      const v = (B ? A[g] * wa + B[g] * wb : A[g]) / scale;
+      val[r * lw + c] = v; if (v < vmin) vmin = v; if (v > vmax) vmax = v;
     }
   }
-
-  // ---- lattice positions (tile-local 0..1) and bands
-  const P = new Buf(Float32Array, np * 2 + 4096), Bd = new Buf(Int16Array, np + 2048);
-  const px = P.a, bd = Bd.a;
+  const nxy = new Float64Array(np * 2);
   const gp = grid.pos, gx = grid.px, gy = grid.py, ox = grid.ox - tx0, oy = grid.oy - ty0;
   for (let r = 0; r < lh; r++) {
-    const vj = (nj0 + r) * s, j = Math.min(ny - 2, Math.floor(vj)), fj = vj - j;
+    const j = (nj0 + r) * s;
     for (let c = 0; c < lw; c++) {
-      let ui = (ni0 + c) * s, shift = 0;
-      if (PER) { shift = Math.floor(ui / PER); ui -= shift * PER; } // world copy: +1 mercator width per period
-      const i = Math.min(nx - 2, Math.floor(ui)), fi = ui - i;
-      let mx, my;
-      if (gx) { // lat/lon: separable, linear along each axis (exact at nodes)
-        mx = gx[i] * (1 - fi) + gx[i + 1] * fi; my = gy[j] * (1 - fj) + gy[j + 1] * fj;
-      } else { // bilinear between the four surrounding nodes (exact at nodes)
-        const g00 = (j * nx + i) * 2, g10 = g00 + 2, g01 = g00 + nx * 2, g11 = g01 + 2;
-        mx = (gp[g00] * (1 - fi) + gp[g10] * fi) * (1 - fj) + (gp[g01] * (1 - fi) + gp[g11] * fi) * fj;
-        my = (gp[g00 + 1] * (1 - fi) + gp[g10 + 1] * fi) * (1 - fj) + (gp[g01 + 1] * (1 - fi) + gp[g11 + 1] * fi) * fj;
-      }
-      const p = r * lw + c;
-      px[p * 2] = (mx + ox + shift) * tz; px[p * 2 + 1] = (my + oy) * tz;
-      bd[p] = Math.floor(val[p]);
+      let i = (ni0 + c) * s, shift = 0;
+      if (PER) { shift = Math.floor(i / PER); i -= shift * PER; } // world copy: +1 mercator width per period
+      const mx = gx ? gx[i] : gp[(j * nx + i) * 2], my = gy ? gy[j] : gp[(j * nx + i) * 2 + 1];
+      const p = (r * lw + c) * 2;
+      nxy[p] = (mx + ox + shift) * tz; nxy[p + 1] = (my + oy) * tz;
     }
   }
-  P.n = np * 2; Bd.n = np;
+  // lattice (x, y) -> tile-local (bilinear between nodes; crossings lie on edges, so linear)
+  const toTile = (x, y, out, o) => {
+    const c = Math.min(lw - 2, Math.max(0, Math.floor(x))), r = Math.min(lh - 2, Math.max(0, Math.floor(y)));
+    const fx = x - c, fy = y - r, p00 = (r * lw + c) * 2, p10 = p00 + 2, p01 = p00 + lw * 2, p11 = p01 + 2;
+    out[o] = (nxy[p00] * (1 - fx) + nxy[p10] * fx) * (1 - fy) + (nxy[p01] * (1 - fx) + nxy[p11] * fx) * fy;
+    out[o + 1] = (nxy[p00 + 1] * (1 - fx) + nxy[p10 + 1] * fx) * (1 - fy) + (nxy[p01 + 1] * (1 - fx) + nxy[p11 + 1] * fx) * fy;
+  };
 
-  // ---- triangles
-  const I = new Buf(Uint32Array, np * 6);
-  const lo = -margin * tz, hi = 1 + margin * tz;
-  const poly = new Int32Array(16);
-
-  // boundary point of `level` on edge (a, b), computed canonically (lower index first)
-  function cross(a, b, level) {
-    if (a > b) { const t = a; a = b; b = t; }
-    const t = (level - val[a]) / (val[b] - val[a]);
-    P.grow(2); Bd.grow(1);
-    const pa = P.a, k = P.n;
-    pa[k] = pa[a * 2] + t * (pa[b * 2] - pa[a * 2]);
-    pa[k + 1] = pa[a * 2 + 1] + t * (pa[b * 2 + 1] - pa[a * 2 + 1]);
-    P.n += 2; Bd.a[Bd.n] = level;
-    return Bd.n++;
-  }
-
-  function slice(a, b, c) {
-    const ba = Bd.a[a], bb = Bd.a[b], bc = Bd.a[c];
-    const kmin = Math.min(ba, bb, bc), kmax = Math.max(ba, bb, bc);
-    const tri = [a, b, c];
-    for (let k = kmin; k <= kmax; k++) {
-      let m = 0, pivot = -1;
-      for (let e = 0; e < 3; e++) {
-        const p = tri[e], q = tri[(e + 1) % 3];
-        const vp = val[p], vq = val[q];
-        if (Bd.a[p] === k) { if (pivot < 0) pivot = m; poly[m++] = p; }
-        if (vp === vq) continue;
-        // crossings of levels k and k+1 on p->q, in order from p to q
-        const up = vp < vq;
-        for (let s2 = 0; s2 < 2; s2++) {
-          const L = up ? k + s2 : k + 1 - s2; // in order from p to q
-          const inside = up ? (vp < L && L <= vq) : (vq < L && L <= vp);
-          if (inside) { const v = cross(p, q, L); if (L === k && pivot < 0) pivot = m; poly[m++] = v; }
-        }
-      }
-      if (m < 3 || pivot < 0) continue;
-      // fan around the pivot; the pivot goes last so it is the provoking vertex
-      I.grow((m - 2) * 3);
-      const ia = I.a;
-      for (let t = 1; t < m - 1; t++) {
-        ia[I.n++] = poly[(pivot + t) % m]; ia[I.n++] = poly[(pivot + t + 1) % m]; ia[I.n++] = poly[pivot];
-      }
+  const lo = Math.floor(vmin + EPS), hi = Math.floor(vmax + EPS);
+  const pxPerUnit = 512, delta = Math.max(1, spacingPx) / pxPerUnit; // one smoothed point per ~spacingPx px
+  // rings, smoothed in tile space (border points pinned)
+  const rings = hi > lo ? traceRings(val, lw, lh, lo + 1, hi) : [];
+  // Rings that run along the window border share it with their parent; earcut
+  // treats such overlapping edges as intersections (and slows down a lot).  So
+  // border points move outward by a small step per level below the top: lower
+  // levels (outer rings) further out, the window furthest.  This all lies in
+  // the margin outside the tile.
+  const eps = 0.2 / (hi - lo + 2); // lattice nodes per level
+  const out = (x, y, d, o, xy) => {
+    xy[o] = x <= 1e-9 ? x - d : x >= lw - 1 - 1e-9 ? x + d : x;
+    xy[o + 1] = y <= 1e-9 ? y - d : y >= lh - 1 - 1e-9 ? y + d : y;
+  };
+  const toTileOut = (x, y, d, arr, o) => {
+    // outside the window: extrapolate from the border nodes
+    const c = Math.min(lw - 2, Math.max(0, Math.floor(x))), r = Math.min(lh - 2, Math.max(0, Math.floor(y)));
+    const fx = x - c, fy = y - r, p00 = (r * lw + c) * 2, p10 = p00 + 2, p01 = p00 + lw * 2, p11 = p01 + 2;
+    arr[o] = (nxy[p00] * (1 - fx) + nxy[p10] * fx) * (1 - fy) + (nxy[p01] * (1 - fx) + nxy[p11] * fx) * fy;
+    arr[o + 1] = (nxy[p00 + 1] * (1 - fx) + nxy[p10 + 1] * fx) * (1 - fy) + (nxy[p01 + 1] * (1 - fx) + nxy[p11 + 1] * fx) * fy;
+  };
+  const tmp = [0, 0];
+  const smooth = rings.map((rg) => {
+    const n = rg.xy.length / 2, tile = new Float64Array(n * 2), pin = new Uint8Array(n);
+    const d = eps * (hi - rg.level + 1);
+    for (let q = 0; q < n; q++) {
+      const x = rg.xy[q * 2], y = rg.xy[q * 2 + 1];
+      pin[q] = x <= 1e-9 || y <= 1e-9 || x >= lw - 1 - 1e-9 || y >= lh - 1 - 1e-9 ? 1 : 0;
+      if (pin[q]) { out(x, y, d, 0, tmp); toTileOut(tmp[0], tmp[1], d, tile, q * 2); } else toTile(x, y, tile, q * 2);
     }
-  }
+    // samples within each spline segment are thinned to those the curve needs
+    // (within 1/8 of the lattice spacing): fewer vertices to triangulate, and
+    // decided per segment, so every tile gets the same curve
+    return smoothRing(tile, pin, delta, Math.max(1, spacingPx) / 8 / pxPerUnit);
+  });
+  const parent = nestRings(rings, lw, lh);
+  const children = Array.from({ length: rings.length + 1 }, () => []); // index rings.length = the window
+  for (let i = 0; i < rings.length; i++) children[parent[i] < 0 ? rings.length : parent[i]].push(i);
 
-  // Merge cells that lie entirely inside one band with a quadtree.  A merged
-  // block is emitted as a fan over *all* lattice points on its perimeter, so it
-  // shares every edge vertex with its finer neighbours: no T-junction cracks.
-  const cw_ = lw - 1, ch_ = lh - 1;
-  const NONE = -32768;
-  const levels = [new Int16Array(cw_ * ch_)];
-  const dims = [[cw_, ch_]];
-  const inTile = new Uint8Array(cw_ * ch_);
-  for (let r = 0; r < ch_; r++) {
-    for (let c = 0; c < cw_; c++) {
-      const p00 = r * lw + c, p10 = p00 + 1, p01 = p00 + lw, p11 = p01 + 1, q = r * cw_ + c;
-      const x0 = px[p00 * 2], x1 = px[p10 * 2], x2 = px[p01 * 2], x3 = px[p11 * 2];
-      const y0_ = px[p00 * 2 + 1], y1_ = px[p10 * 2 + 1], y2_ = px[p01 * 2 + 1], y3_ = px[p11 * 2 + 1];
-      inTile[q] = !(Math.max(x0, x1, x2, x3) < lo || Math.min(x0, x1, x2, x3) > hi ||
-                    Math.max(y0_, y1_, y2_, y3_) < lo || Math.min(y0_, y1_, y2_, y3_) > hi);
-      const b0 = bd[p00];
-      levels[0][q] = (bd[p10] === b0 && bd[p01] === b0 && bd[p11] === b0) ? b0 : NONE;
+  const P = new Buf(Float32Array, 65536), Bd = new Buf(Int16Array, 32768), I = new Buf(Uint32Array, 98304);
+  const r0 = -TILE_OVERLAP, r1 = 1 + TILE_OVERLAP;
+  const put = (ax, ay, bx, by, cx, cy, band) => {
+    if (Math.max(ax, bx, cx) < r0 || Math.min(ax, bx, cx) > r1 || Math.max(ay, by, cy) < r0 || Math.min(ay, by, cy) > r1) return;
+    P.grow(6); Bd.grow(3); I.grow(3);
+    const k = Bd.n, pa = P.a;
+    pa[P.n++] = ax; pa[P.n++] = ay; pa[P.n++] = bx; pa[P.n++] = by; pa[P.n++] = cx; pa[P.n++] = cy;
+    Bd.a[Bd.n++] = band; Bd.a[Bd.n++] = band; Bd.a[Bd.n++] = band;
+    I.a[I.n++] = k; I.a[I.n++] = k + 1; I.a[I.n++] = k + 2;
+  };
+  const emit = put;
+  // one band: outer ring minus its holes
+  const fillBand = (outer, holes, band) => {
+    const flat = Array.from(outer), hi_ = [];
+    for (const h of holes) { hi_.push(flat.length / 2); for (const v of h) flat.push(v); }
+    const tri = earcut(flat, hi_.length ? hi_ : null);
+    for (let t = 0; t < tri.length; t += 3) {
+      const a = tri[t] * 2, b = tri[t + 1] * 2, c = tri[t + 2] * 2;
+      emit(flat[a], flat[a + 1], flat[b], flat[b + 1], flat[c], flat[c + 1], band);
     }
+  };
+  // the window (lowest band) minus the outermost rings
+  {
+    const ring = [], d = eps * (hi - lo + 2);
+    const put = (x, y) => { const o = ring.length; ring.push(0, 0); out(x, y, d, 0, tmp); toTileOut(tmp[0], tmp[1], d, ring, o); };
+    for (let c = 0; c < lw; c++) put(c, 0);
+    for (let r = 1; r < lh; r++) put(lw - 1, r);
+    for (let c = lw - 2; c >= 0; c--) put(c, lh - 1);
+    for (let r = lh - 2; r > 0; r--) put(0, r);
+    fillBand(ring, children[rings.length].map((i) => smooth[i]), lo);
   }
-  const OUT = -32767; // block entirely outside the tile
-  for (let q = 0; q < cw_ * ch_; q++) if (!inTile[q]) levels[0][q] = levels[0][q] === NONE ? NONE : levels[0][q];
-  const MAXK = 7;
-  for (let k = 1; k <= MAXK; k++) {
-    const [pw, ph] = dims[k - 1], w2 = Math.ceil(pw / 2), h2 = Math.ceil(ph / 2);
-    const prev = levels[k - 1], cur = new Int16Array(w2 * h2);
-    for (let r = 0; r < h2; r++) {
-      for (let c = 0; c < w2; c++) {
-        let v = null;
-        for (let dr = 0; dr < 2 && v !== NONE; dr++) {
-          for (let dc = 0; dc < 2; dc++) {
-            const rr = 2 * r + dr, cc = 2 * c + dc;
-            if (rr >= ph || cc >= pw) continue;
-            const b = prev[rr * pw + cc];
-            if (b === NONE || (v !== null && b !== v)) { v = NONE; break; }
-            v = b;
-          }
-        }
-        cur[r * w2 + c] = v;
-      }
-    }
-    levels.push(cur); dims.push([w2, h2]);
+  // each ring minus its children, in the band just inside it
+  for (let i = 0; i < rings.length; i++) {
+    fillBand(smooth[i], children[i].map((j) => smooth[j]), rings[i].area < 0 ? rings[i].level : rings[i].level - 1);
   }
-
-  function emitBlock(c0, r0, c1, r1) {
-    // perimeter lattice points, counter-clockwise in lattice space
-    const n = 2 * (c1 - c0) + 2 * (r1 - r0);
-    I.grow((n - 2) * 3);
-    const ia = I.a, first = r0 * lw + c0;
-    let prevPt = -1;
-    const put = (pt) => {
-      if (prevPt >= 0 && prevPt !== first) { ia[I.n++] = first; ia[I.n++] = prevPt; ia[I.n++] = pt; }
-      prevPt = pt;
-    };
-    for (let c = c0; c <= c1; c++) put(r0 * lw + c);
-    for (let r = r0 + 1; r <= r1; r++) put(r * lw + c1);
-    for (let c = c1 - 1; c >= c0; c--) put(r1 * lw + c);
-    for (let r = r1 - 1; r > r0; r--) put(r * lw + c0);
-  }
-
-  function cellTouchesTile(c0, r0, c1, r1) {
-    for (let r = r0; r < r1; r++) for (let c = c0; c < c1; c++) if (inTile[r * cw_ + c]) return true;
-    return false;
-  }
-
-  function visit(k, bc, br) {
-    const size = 1 << k;
-    const c0 = bc * size, r0 = br * size;
-    if (c0 >= cw_ || r0 >= ch_) return;
-    const c1 = Math.min(cw_, c0 + size), r1 = Math.min(ch_, r0 + size);
-    const band = levels[k][br * dims[k][0] + bc];
-    if (band !== NONE) {
-      if (k === 0 ? inTile[r0 * cw_ + c0] : cellTouchesTile(c0, r0, c1, r1)) emitBlock(c0, r0, c1, r1);
-      return;
-    }
-    if (k === 0) {
-      if (!inTile[r0 * cw_ + c0]) return;
-      const p00 = r0 * lw + c0, p10 = p00 + 1, p01 = p00 + lw, p11 = p01 + 1;
-      slice(p00, p10, p11);
-      slice(p00, p11, p01);
-      return;
-    }
-    for (let dr = 0; dr < 2; dr++) for (let dc = 0; dc < 2; dc++) visit(k - 1, bc * 2 + dc, br * 2 + dr);
-  }
-  const [tw, th] = dims[MAXK];
-  for (let br = 0; br < th; br++) for (let bc = 0; bc < tw; bc++) visit(MAXK, bc, br);
   return { pos: P.out(), band: Bd.out(), index: I.out(), lattice: [lw, lh], step: s };
 }
 
-// value at lon/lat (bicubic, same kernel as the contours), for the readout
+const TILE_OVERLAP = 1 / 64; // triangles within this of the tile are kept (the stencil trims them)
+
+// Parent of every ring (index, or -1 for the window): the smallest ring that
+// contains it.  Rings of a marching-squares trace never cross, so one vertex off
+// the window border tells.  Rings that run only along the border have the same
+// outline at several levels; they nest by level (a higher level's warm region
+// inside a lower one's, a lower level's hole inside a higher one's).
+// Candidates come from a coarse grid of ring bounding boxes.
+function nestRings(rings, lw, lh) {
+  const n = rings.length, parent = new Int32Array(n).fill(-1);
+  if (n < 2) return parent;
+  const box = new Float64Array(n * 4), area = new Float64Array(n), probe = new Float64Array(n * 2), border = new Uint8Array(n);
+  const onB = (x, y) => x <= 1e-9 || y <= 1e-9 || x >= lw - 1 - 1e-9 || y >= lh - 1 - 1e-9;
+  for (let i = 0; i < n; i++) {
+    const xy = rings[i].xy;
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, found = false;
+    for (let q = 0; q < xy.length; q += 2) {
+      const x = xy[q], y = xy[q + 1];
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (!found && q + 3 < xy.length && !onB(x, y) && !onB(xy[q + 2], xy[q + 3])) {
+        // midpoint of a segment: inside a cell, off every other ring, off row lines
+        probe[i * 2] = (x + xy[q + 2]) / 2; probe[i * 2 + 1] = (y + xy[q + 3]) / 2; found = true;
+      }
+    }
+    box.set([x0, x1, y0, y1], i * 4); area[i] = Math.abs(rings[i].area); border[i] = found ? 0 : 1;
+  }
+  // total order, inner first: area, then (same outline) by level as above
+  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => {
+    const d = area[a] - area[b];
+    if (Math.abs(d) > 1e-9 * Math.max(area[a], area[b])) return d;
+    const oa = rings[a].area < 0, ob = rings[b].area < 0;
+    return (oa ? -rings[a].level : rings[a].level) - (ob ? -rings[b].level : rings[b].level);
+  });
+  const rank = new Int32Array(n), rowIndex = new Map();
+  order.forEach((i, r) => { rank[i] = r; });
+  // rings along the border only: each inside the next one of them in the order
+  let prev = -1;
+  for (const i of order) if (border[i]) { if (prev >= 0) parent[prev] = i; prev = i; }
+  const G = 32, gx = (lw + 1) / G, gy = (lh + 1) / G;
+  const cell = (x, y) => Math.min(G - 1, Math.max(0, Math.floor((x + 1) / gx))) + G * Math.min(G - 1, Math.max(0, Math.floor((y + 1) / gy)));
+  const buckets = Array.from({ length: G * G }, () => []);
+  for (const i of order) {
+    const c0 = cell(box[i * 4], box[i * 4 + 2]), c1 = cell(box[i * 4 + 1], box[i * 4 + 3]);
+    for (let cy = Math.floor(c0 / G); cy <= Math.floor(c1 / G); cy++) for (let cx = c0 % G; cx <= c1 % G; cx++) buckets[cy * G + cx].push(i);
+  }
+  for (let i = 0; i < n; i++) {
+    if (border[i]) continue;
+    const px = probe[i * 2], py = probe[i * 2 + 1];
+    for (const j of buckets[cell(px, py)]) {
+      if (rank[j] <= rank[i]) continue;
+      if (px < box[j * 4] || px > box[j * 4 + 1] || py < box[j * 4 + 2] || py > box[j * 4 + 3]) continue;
+      if (inRingRows(px, py, j)) { parent[i] = j; break; }
+    }
+  }
+  return parent;
+
+  // point-in-ring with the ring's edges bucketed by lattice row (built on first use):
+  // marching-squares edges stay inside one cell, so one row's edges decide
+  function inRingRows(x, y, j) {
+    let rows = rowIndex.get(j);
+    if (!rows) {
+      rows = new Map();
+      const xy = rings[j].xy, m = xy.length / 2;
+      for (let q = 0, p = m - 1; q < m; p = q++) {
+        const ya = xy[p * 2 + 1], yb = xy[q * 2 + 1];
+        for (let r = Math.floor(Math.min(ya, yb)); r <= Math.floor(Math.max(ya, yb)); r++) {
+          let a = rows.get(r); if (!a) rows.set(r, (a = [])); a.push(p, q);
+        }
+      }
+      rowIndex.set(j, rows);
+    }
+    const e = rows.get(Math.floor(y));
+    if (!e) return false;
+    const xy = rings[j].xy;
+    let c = false;
+    for (let k = 0; k < e.length; k += 2) {
+      const p = e[k], q = e[k + 1], xq = xy[q * 2], yq = xy[q * 2 + 1], xp = xy[p * 2], yp = xy[p * 2 + 1];
+      if ((yq > y) !== (yp > y) && x < (xp - xq) * (y - yq) / (yp - yq) + xq) c = !c;
+    }
+    return c;
+  }
+}
+
+
+const EPS = 1e-4; // contour levels sit this far below each integer (data are in 0.1-degree steps)
+const GHOST = -1e30; // the border around the window: below every level
+
+// Marching squares for every level t in [t0, t1] at once: closed rings of the
+// superlevel set {v >= t - EPS}, in lattice coordinates, with the window closed by
+// a GHOST border.  Segments keep the "above" side on their left (y down), so a
+// ring around a warm region has negative area and a hole positive area.
+// Edge ids: horizontal edge (i, j)-(i+1, j) = 2 (j W + i), vertical (i, j)-(i, j+1) = +1,
+// in border-padded coordinates (W = lw + 2).
+function traceRings(val, lw, lh, t0, t1) {
+  const W = lw + 2, H = lh + 2, nl = t1 - t0 + 1;
+  const V = (i, j) => (i < 1 || j < 1 || i > lw || j > lh ? GHOST : val[(j - 1) * lw + (i - 1)]);
+  // segments of every level, as flat arrays (start edge, end edge, level)
+  let cap = 1 << 16, sS = new Int32Array(cap), sE = new Int32Array(cap), sL = new Int32Array(cap), ns = 0;
+  const seg = (a, b, q) => {
+    if (ns === cap) { cap *= 2; const g = (x) => { const y = new Int32Array(cap); y.set(x); return y; }; sS = g(sS); sE = g(sE); sL = g(sL); }
+    sS[ns] = a; sE[ns] = b; sL[ns++] = q;
+  };
+  for (let j = 0; j < H - 1; j++) {
+    for (let i = 0; i < W - 1; i++) {
+      const a = V(i, j), b = V(i + 1, j), c = V(i + 1, j + 1), d = V(i, j + 1);
+      const mn = Math.min(a, b, c, d), mx = Math.max(a, b, c, d);
+      const ta = Math.max(t0, Math.floor(mn + EPS) + 1), tb = Math.min(t1, Math.floor(mx + EPS));
+      if (ta > tb) continue;
+      const T = 2 * (j * W + i), Bm = 2 * ((j + 1) * W + i), Lf = T + 1, R = 2 * (j * W + i + 1) + 1;
+      for (let t = ta; t <= tb; t++) {
+        const L = t - EPS, q = t - t0;
+        switch ((a >= L ? 1 : 0) | (b >= L ? 2 : 0) | (c >= L ? 4 : 0) | (d >= L ? 8 : 0)) {
+          case 1: seg(Lf, T, q); break;
+          case 2: seg(T, R, q); break;
+          case 3: seg(Lf, R, q); break;
+          case 4: seg(R, Bm, q); break;
+          case 5: if ((a + b + c + d) / 4 >= L) { seg(R, T, q); seg(Lf, Bm, q); } else { seg(Lf, T, q); seg(R, Bm, q); } break;
+          case 6: seg(T, Bm, q); break;
+          case 7: seg(Lf, Bm, q); break;
+          case 8: seg(Bm, Lf, q); break;
+          case 9: seg(Bm, T, q); break;
+          case 10: if ((a + b + c + d) / 4 >= L) { seg(T, Lf, q); seg(Bm, R, q); } else { seg(T, R, q); seg(Bm, Lf, q); } break;
+          case 11: seg(Bm, R, q); break;
+          case 12: seg(R, Lf, q); break;
+          case 13: seg(R, T, q); break;
+          case 14: seg(T, Lf, q); break;
+        }
+      }
+    }
+  }
+  // group segments by level (counting sort), then chain each level through a
+  // start-edge -> end-edge table (reset after each level)
+  const cnt = new Int32Array(nl + 1);
+  for (let k = 0; k < ns; k++) cnt[sL[k] + 1]++;
+  for (let q = 0; q < nl; q++) cnt[q + 1] += cnt[q];
+  const byL = new Int32Array(ns), fillp = cnt.slice(0, nl);
+  for (let k = 0; k < ns; k++) byL[fillp[sL[k]]++] = k;
+  const next = new Int32Array(2 * W * H).fill(-1);
+  const rings = [];
+  for (let q = 0; q < nl; q++) {
+    const L = t0 + q - EPS;
+    for (let k = cnt[q]; k < cnt[q + 1]; k++) next[sS[byL[k]]] = sE[byL[k]];
+    for (let k = cnt[q]; k < cnt[q + 1]; k++) {
+      const e0 = sS[byL[k]];
+      if (next[e0] < 0) continue; // already used
+      const xy = [];
+      let e = e0, area = 0, guard = 0;
+      do {
+        const vert = e & 1, idx = e >> 1, i = idx % W, j = (idx - i) / W;
+        const v0 = V(i, j), v1 = vert ? V(i, j + 1) : V(i + 1, j);
+        const f = Math.min(1, Math.max(0, (L - v0) / (v1 - v0)));
+        xy.push(vert ? i - 1 : i - 1 + f, vert ? j - 1 + f : j - 1);
+        const nx = next[e]; next[e] = -1; e = nx;
+      } while (e !== e0 && e >= 0 && ++guard < 1e7);
+      const n = xy.length / 2;
+      if (n < 3) continue;
+      for (let p = 0; p < n; p++) { const r = (p + 1) % n; area += xy[p * 2] * xy[r * 2 + 1] - xy[r * 2] * xy[p * 2 + 1]; }
+      if (Math.abs(area) < 1e-12) continue;
+      rings.push({ level: t0 + q, xy, area: area / 2 });
+    }
+  }
+  return rings;
+}
+
+// Storm's ring smoothing: for each segment p1 -> p2 of a closed ring, the uniform
+// cubic B-spline of p0..p3, sampled every `delta` along the segment.  Pinned points
+// (on the window border) are kept exactly: segments touching them stay straight,
+// and a spline segment next to one uses a mirrored phantom point so it starts or
+// ends exactly on it.  Rings under 4 points are kept as they are (like storm).
+function smoothRing(ring, pin, delta, tol = 0) {
+  const n = ring.length / 2;
+  if (n < 4) return Array.from(ring);
+  const out = [];
+  const w = new Float64Array(4);
+  for (let i = 0; i < n; i++) {
+    const i0 = (i - 1 + n) % n, i2 = (i + 1) % n, i3 = (i + 2) % n;
+    const x1 = ring[i * 2], y1 = ring[i * 2 + 1], x2 = ring[i2 * 2], y2 = ring[i2 * 2 + 1];
+    if (pin[i] || pin[i2]) { out.push(x1, y1); continue; } // straight along the border
+    let x0 = ring[i0 * 2], y0 = ring[i0 * 2 + 1], x3 = ring[i3 * 2], y3 = ring[i3 * 2 + 1];
+    if (pin[i0]) { x0 = 2 * x1 - x2; y0 = 2 * y1 - y2; }
+    if (pin[i3]) { x3 = 2 * x2 - x1; y3 = 2 * y2 - y1; }
+    // one point per delta, at most 64 per segment (zoomed far in a segment spans
+    // thousands of px; 64 chords of a cubic stay within ~0.2 px of the curve)
+    const k = Math.min(64, Math.max(1, Math.ceil(Math.hypot(x2 - x1, y2 - y1) / delta)));
+    const sx = new Float64Array(k + 1), sy = new Float64Array(k + 1);
+    for (let q = 0; q <= k; q++) {
+      bspline(q / k, w, 0);
+      sx[q] = w[0] * x0 + w[1] * x1 + w[2] * x2 + w[3] * x3; sy[q] = w[0] * y0 + w[1] * y1 + w[2] * y2 + w[3] * y3;
+    }
+    // Douglas-Peucker within the segment (its end is the next segment's start)
+    const keep = new Uint8Array(k + 1); keep[0] = keep[k] = 1;
+    if (k > 1 && tol > 0) {
+      const stack = [0, k], t2 = tol * tol;
+      while (stack.length) {
+        const e = stack.pop(), b = stack.pop(), dx = sx[e] - sx[b], dy = sy[e] - sy[b], L = dx * dx + dy * dy;
+        let best = -1, bd = t2;
+        for (let q = b + 1; q < e; q++) {
+          const px = sx[q] - sx[b], py = sy[q] - sy[b], t = L ? Math.max(0, Math.min(1, (px * dx + py * dy) / L)) : 0;
+          const d = (px - t * dx) ** 2 + (py - t * dy) ** 2;
+          if (d > bd) { bd = d; best = q; }
+        }
+        if (best >= 0) { keep[best] = 1; stack.push(b, best, best, e); }
+      }
+    } else keep.fill(1);
+    for (let q = 0; q < k; q++) if (keep[q]) out.push(sx[q], sy[q]);
+  }
+  return out;
+}
+
+// value at lon/lat for the readout: bilinear on the raw grid (what the rings are traced from)
 export function sample(grid, fields, w, lon, lat) {
   const [u, v] = grid.lonLatToIJ(lon, lat);
   const { nx, ny } = grid;
   if (u < 0 || v < 0 || u > nx - 1 || v > ny - 1) return null;
   const A = fields[0], B = fields[1];
-  const bi = Math.floor(u), bj = Math.floor(v), wx = new Float64Array(4), wy = new Float64Array(4);
-  bspline(u - bi, wx, 0); bspline(v - bj, wy, 0);
-  const PER = grid.period, col = (c) => (PER ? ((c % PER) + PER) % PER : Math.min(nx - 1, Math.max(0, c)));
-  let acc = 0;
-  for (let r = 0; r < 4; r++) {
-    const jj = Math.min(ny - 1, Math.max(0, bj - 1 + r));
-    for (let c = 0; c < 4; c++) {
-      const g = jj * nx + col(bi - 1 + c);
-      acc += wy[r] * wx[c] * (B ? A[g] * (1 - w) + B[g] * w : A[g]);
-    }
-  }
+  const i = Math.min(nx - 2, Math.floor(u)), j = Math.min(ny - 2, Math.floor(v)), fx = u - i, fy = v - j;
+  const at = (c, r) => { const g = r * nx + c; return B ? A[g] * (1 - w) + B[g] * w : A[g]; };
+  const acc = (at(i, j) * (1 - fx) + at(i + 1, j) * fx) * (1 - fy) + (at(i, j + 1) * (1 - fx) + at(i + 1, j + 1) * fx) * fy;
   return acc / grid.meta.scale;
 }
 
@@ -379,3 +492,4 @@ export function levelMeta(meta, k) {
   if (k === 1) return meta;
   return { ...meta, levelK: k, nx: (meta.nx - 1) / k + 1, ny: (meta.ny - 1) / k + 1, dx: meta.dx * k };
 }
+
