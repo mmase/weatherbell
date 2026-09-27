@@ -177,6 +177,18 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
   // ---------------------------------------------------------------- tile packs
   // Tiles are gzipped MVT grouped into pack files: [u32 n][n x (z,x,y,off,len)][data].
   const meta = await (await fetch("tiles/meta.json")).json();
+  // Binary files are served as-is, or as base64 text where the host only serves text.
+  const b64 = meta.encoding === "base64";
+  async function fetchBin(path) {
+    const r = await fetch(b64 ? path.replace(/\.\w+$/, ".txt") : path);
+    if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
+    if (!b64) return r.arrayBuffer();
+    const s = (await r.text()).trim();
+    if (Uint8Array.fromBase64) return Uint8Array.fromBase64(s).buffer;
+    const bin = atob(s), out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
+  }
   const havePack = new Set(meta.packs);
   const packKey = (z, x, y) => {
     if (z <= 4) return `${z}-0-0`;
@@ -187,10 +199,7 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
   function getPack(key) {
     let p = packs.get(key);
     if (p) { packs.delete(key); packs.set(key, p); return p; }
-    p = fetch(`tiles/${key}.bin`).then((r) => {
-      if (!r.ok) throw new Error(`pack ${key}: HTTP ${r.status}`);
-      return r.arrayBuffer();
-    }).then((buf) => {
+    p = fetchBin(`tiles/${key}.bin`).then((buf) => {
       const dv = new DataView(buf), n = dv.getUint32(0, true), index = new Map();
       for (let i = 0, o = 4; i < n; i++, o += 20)
         index.set(`${dv.getUint32(o, true)}/${dv.getUint32(o + 4, true)}/${dv.getUint32(o + 8, true)}`,
@@ -213,6 +222,8 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
     const stream = new Blob([new Uint8Array(buf, e[0], e[1])]).stream().pipeThrough(new DecompressionStream("gzip"));
     return { data: await new Response(stream).arrayBuffer() };
   });
+  maplibregl.addProtocol("hrrrglyph", async (params) =>
+    ({ data: await fetchBin(`glyphs/${decodeURIComponent(params.url.slice(12))}.pbf`) }));
   ["2-0-0", "3-0-0", "4-0-0"].forEach((k) => havePack.has(k) && getPack(k)); // warm the overview packs
 
   // ---------------------------------------------------------------- style
@@ -239,7 +250,7 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
     maxBounds: [[-160, 5], [-35, 65]],
     style: {
       version: 8,
-      glyphs: abs("glyphs/") + "{fontstack}/{range}.pbf",
+      glyphs: "hrrrglyph://{fontstack}/{range}",
       sources: {
         t2m: { type: "vector", tiles: ["hrrr://{z}/{x}/{y}"], minzoom: meta.minzoom, maxzoom: meta.maxzoom },
         geo: { type: "geojson", data: abs("boundaries.json"), tolerance: 0.25 },

@@ -54,7 +54,9 @@ visible colour at any point is the colour of the band floor(T) to floor(T)+1:
 Tiles are gzipped and grouped into 364 pack files: one per zoom for z2–z4, per z5
 ancestor for z5–z6, and per z7 ancestor for z7–z9. The site is then just static files,
 with no range requests and no tile server. The client fetches a pack once, then slices
-and inflates tiles with `DecompressionStream`. The z2–z4 packs are prefetched.
+and inflates tiles with `DecompressionStream`. The z2–z4 packs are prefetched. If
+`meta.json` has `"encoding": "base64"`, the client fetches `.txt` base64 copies of the
+packs and glyphs instead, for hosts that only serve text.
 
 | zoom | tiles | avg tile (gz) |
 |---|---|---|
