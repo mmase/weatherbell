@@ -53,12 +53,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="2026022200")
     ap.add_argument("--hours", type=int, default=72)
-    ap.add_argument("--region", default="33,50,-90,-60", help="lat0,lat1,lon0,lon1")
+    ap.add_argument("--region", default="global", help="'global' or lat0,lat1,lon0,lon1")
     ap.add_argument("--out", default="web/live/run")
     ap.add_argument("--tiles-maxzoom", type=int, default=6)
     a = ap.parse_args()
     run = dt.datetime.strptime(a.run, "%Y%m%d%H")
-    la0, la1, lo0, lo1 = (float(x) for x in a.region.split(","))
+    # whole model domain by default; web mercator stops at +-85 deg
+    la0, la1, lo0, lo1 = (-85, 85, -180, 180) if a.region == "global" else (float(x) for x in a.region.split(","))
     out = os.path.join(a.out, "snow")
     grids = os.path.join(out, "grids")
     os.makedirs(grids, exist_ok=True)
@@ -74,6 +75,9 @@ def main():
     rows = np.nonzero((lats >= la0) & (lats <= la1))[0][::-1]  # south -> north
     cols = np.nonzero((lons >= lo0) & (lons <= lo1))[0]
     cols = cols[np.argsort(lons[cols])]
+    wrap = a.region == "global"
+    if wrap:  # repeat -180 as +180 so the grid closes at the date line
+        cols = np.concatenate([cols, cols[:1]])
     vmax = 0.0
     for fh, acc in steps:
         v = acc[np.ix_(rows, cols)]
@@ -90,9 +94,9 @@ def main():
                 "decimals": 1, "thresholds": THRESHOLDS, "colors": COLORS, "labels": LABELS,
                 "alt": {"factor": 2.54, "units": "cm"}},
         "scale": SCALE,
-        "nx": len(cols), "ny": len(rows), "dx": d,
+        "nx": len(cols), "ny": len(rows), "dx": d, "global": wrap,
         "x0": float(lons[cols[0]]), "y0": float(lats[rows[0]]),
-        "proj": {"type": "latlon", "R": 6371229.0, "lat0": (la0 + la1) / 2},
+        "proj": {"type": "latlon", "R": 6371229.0, "lat0": 41.0 if wrap else (la0 + la1) / 2},
         "vmin": 0.0, "vmax": vmax,
         "tmin": -1.0, "tmax": float(to_bands(vmax)),
         "view": {"center": [-74.5, 41.2], "zoom": 5.4},
@@ -108,9 +112,11 @@ def main():
     for fh in hours:
         _, packs, nbytes, secs = build_tiles.build(
             os.path.join(grids, f"f{fh:02d}.i16.gz"), os.path.join(out, "tiles", f"f{fh:02d}"),
-            2, a.tiles_maxzoom, log=False, pack=build_tiles.live_pack_key, label_levels=label_bands)
+            2, a.tiles_maxzoom, log=False, pack=build_tiles.live_pack_key, label_levels=label_bands,
+            min_band=0)  # under 0.1 in is transparent
         meta["tiles"]["packs"][f"{fh:02d}"] = sorted("%d-%d-%d" % k for k in packs)
-        print(f"f{fh:02d}: z2-{a.tiles_maxzoom} tiles {secs:.1f}s, {nbytes / 1e3:.0f} KB", flush=True)
+        print(f"f{fh:02d}: z2-{a.tiles_maxzoom} tiles {secs:.1f}s, {sum(len(v) for v in packs.values())} tiles, "
+              f"{nbytes / 1e3:.0f} KB", flush=True)
     with open(os.path.join(out, "meta.json"), "w") as fp:
         json.dump(meta, fp)
     idx_path = os.path.join(a.out, "index.json")

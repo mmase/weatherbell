@@ -396,10 +396,14 @@ def ragged(geoms, kind):
 FIELD = None
 
 
-def init_worker(path, label_levels=None):
-    global FIELD, LABEL_LEVELS
+MIN_BAND = None  # bands below this are transparent: not emitted, and empty tiles skipped
+
+
+def init_worker(path, label_levels=None, min_band=None):
+    global FIELD, LABEL_LEVELS, MIN_BAND
     FIELD = Field(path)
     LABEL_LEVELS = label_levels
+    MIN_BAND = min_band
 
 
 def tile_bounds(z, x, y):
@@ -422,6 +426,12 @@ def build_tile(zxy):
     gi, gj = (np.array(lx) - fld.x0) / fld.dx, (np.array(ly) - fld.y0) / fld.dx
     s = fld.spacing(z)
     pad = 2 * s
+    if MIN_BAND is not None:
+        # nothing visible here? (checked on the raw grid, with room for bicubic overshoot)
+        r0, r1 = max(0, int(gj.min() - 3)), min(fld.ny, int(gj.max() + 4))
+        c0, c1 = max(0, int(gi.min() - 3)), min(fld.nx, int(gi.max() + 4))
+        if r1 <= r0 or c1 <= c0 or fld.F[r0:r1, c0:c1].max() < MIN_BAND - 0.5:
+            return zxy, None
     lat = fld.lattice(z, gi.min() - pad, gi.max() + pad, gj.min() - pad, gj.max() + pad)
     if lat is None:
         return zxy, None
@@ -437,6 +447,10 @@ def build_tile(zxy):
     # exactly the t-degree isolines (each isoline is stored once).  The t == lo
     # polygon is the data footprint, so the stack covers the domain with no gaps.
     fills, lines = [], []
+    if MIN_BAND is not None:
+        if hi < MIN_BAND:
+            return zxy, None
+        lo = max(lo, MIN_BAND)
     for t in range(lo, hi + 1):
         # Contour just below t: identical membership for data stored in 0.1-degree
         # steps, but no sample sits exactly on a level (which makes 0-area rings).
@@ -525,7 +539,8 @@ def domain_tiles(fld, z):
     return [(z, x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
 
-def build(source, out, minzoom=MINZOOM, maxzoom=MAXZOOM, workers=None, log=True, pack=None, label_levels=None):
+def build(source, out, minzoom=MINZOOM, maxzoom=MAXZOOM, workers=None, log=True, pack=None, label_levels=None,
+          min_band=None):
     """Build zooms minzoom..maxzoom from a GRIB2 file or a published grid into
     pack files in `out`.  Returns (tiles, packs, bytes, seconds)."""
     t0 = time.time()
@@ -536,7 +551,7 @@ def build(source, out, minzoom=MINZOOM, maxzoom=MAXZOOM, workers=None, log=True,
     jobs.sort(key=lambda t: t[0])
     packs = {}
     nbytes = 0
-    with Pool(workers or os.cpu_count(), initializer=init_worker, initargs=(source, label_levels)) as pool:
+    with Pool(workers or os.cpu_count(), initializer=init_worker, initargs=(source, label_levels, min_band)) as pool:
         for n, (zxy, data) in enumerate(pool.imap_unordered(build_tile, jobs, chunksize=2)):
             if data:
                 packs.setdefault((pack or pack_key)(*zxy), []).append((zxy, data))
