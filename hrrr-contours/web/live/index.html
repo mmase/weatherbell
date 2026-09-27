@@ -136,7 +136,7 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
 
 <section id="info" class="panel" aria-live="polite">
   <div>
-    <div class="eyebrow">HRRR · CONUS 3 km · Forecast</div>
+    <div class="eyebrow" id="eyebrow">Forecast</div>
     <h1 id="title">Loading…</h1>
     <div class="run" id="run">Loading…</div>
   </div>
@@ -149,7 +149,7 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
     <button class="chip" id="t-labels" aria-pressed="true">Labels</button>
     <button class="chip" id="t-borders" aria-pressed="true">Borders</button>
   </div>
-  <div class="credit"><span id="credit-bands"></span> Zoomed out: tiles built when the run is published. Zoomed in and during playback: contoured on this device from the model grid. Data: NOAA/NCEP HRRR via <a href="https://registry.opendata.aws/noaa-hrrr-pds/" target="_blank" rel="noopener">AWS Open Data</a>. Boundaries: Natural Earth, US Census.</div>
+  <div class="credit"><span id="credit-bands"></span> Zoomed out: tiles built when the run is published. Zoomed in and during playback: contoured on this device from the model grid. Data: NOAA/NCEP <span id="credit-model">HRRR</span> via <a id="credit-link" href="https://registry.opendata.aws/noaa-hrrr-pds/" target="_blank" rel="noopener">AWS Open Data</a>. Boundaries: Natural Earth, US Census.</div>
 </section>
 
 <div id="zoom"><button id="zin" aria-label="Zoom in">+</button><button id="zout" aria-label="Zoom out">−</button></div>
@@ -178,7 +178,8 @@ const RUNS = await (await fetch("run/index.json")).json();
 const VAR_ID = RUNS.vars.some((v) => v.id === location.hash.slice(1)) ? location.hash.slice(1) : RUNS.vars[0].id;
 const BASE = `run/${VAR_ID}/`;
 const meta = await (await fetch(`${BASE}meta.json`)).json();
-const VAR = meta.var, STEP = VAR.interval, DEC = VAR.decimals;
+const VAR = meta.var, STEP = VAR.interval ?? 1, DEC = VAR.decimals;
+const TH = VAR.thresholds || null; // uneven bands: band b covers [TH[b], TH[b+1])
 const STOPS = VAR.stops; // display units -> colour
 const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
 const lin = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
@@ -197,7 +198,7 @@ function fromLab([L, a, bb]) {
   const r = 3.2406 * x - 1.5372 * y - 0.4986 * z, g = -0.9689 * x + 1.8758 * y + 0.0415 * z, b = 0.0557 * x - 0.2040 * y + 1.0570 * z;
   return [r, g, b].map((c) => Math.max(0, Math.min(255, Math.round(gam(Math.max(0, c))))));
 }
-const LABS = STOPS.map(([t, c]) => [t, toLab(hex(c))]);
+const LABS = (STOPS || []).map(([t, c]) => [t, toLab(hex(c))]);
 function colorAt(v) {
   if (v <= LABS[0][0]) return fromLab(LABS[0][1]);
   for (let i = 1; i < LABS.length; i++) {
@@ -210,10 +211,23 @@ function colorAt(v) {
 }
 // Contours work in band units (value / interval): band b covers [b, b+1) * interval.
 const BAND0 = Math.floor(meta.tmin) - 64; // palette texel 0
-const bandRGB = (b) => colorAt((b + 0.5) * STEP);
+// colour per band; null = transparent (e.g. snowfall under the first threshold)
+const bandRGB = (b) => {
+  if (!VAR.colors) return colorAt((b + 0.5) * STEP);
+  if (b < 0) return null;
+  return hex(VAR.colors[Math.min(b, VAR.colors.length - 1)]);
+};
 const fmtV = (v, extra = 0) => v.toFixed(DEC + extra);
 const UNIT = VAR.units, isTemp = VAR.id === "t2m";
-const rgbStr = ([r, g, b]) => `rgb(${r},${g},${b})`;
+const rgbStr = (c) => (c ? `rgb(${c[0]},${c[1]},${c[2]})` : "rgba(0,0,0,0)");
+// band units <-> display units
+function toValue(u) {
+  if (!TH) return u * STEP;
+  if (u < 0) return Math.max(0, (u + 1) * TH[0]);
+  const b = Math.min(Math.floor(u), TH.length - 2), f = u - b;
+  return TH[b] + f * (TH[b + 1] - TH[b]);
+}
+const bandText = (b) => (!TH ? `${fmtV(b * STEP)}–${fmtV((b + 1) * STEP)}` : b < 0 ? `< ${TH[0]}` : b >= TH.length - 1 ? `> ${TH[TH.length - 1]}` : `${TH[b]}–${TH[b + 1]}`);
 
 // ------------------------------------------------------------------ data
 const b64 = meta.encoding === "base64";
@@ -291,7 +305,7 @@ void main() { gl_Position = u_matrix * vec4(a_pos * 2.0 - 0.25, 0.0, 1.0); v_ban
 const FS = `#version 300 es
 precision highp float;
 flat in int v_band; uniform sampler2D u_pal; out vec4 color;
-void main() { color = texelFetch(u_pal, ivec2(clamp(v_band - ${BAND0}, 0, 255), 0), 0); }`;
+void main() { color = texelFetch(u_pal, ivec2(clamp(v_band - ${BAND0}, 0, 255), 0), 0); if (color.a == 0.0) discard; }`;
 
 const cache = new Map();    // tileKey -> {vao, bufs, count, bytes, used}
 const inflight = new Set();
@@ -329,7 +343,7 @@ const live = {
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
     this.prog = p; this.uMatrix = gl.getUniformLocation(p, "u_matrix"); this.uPal = gl.getUniformLocation(p, "u_pal");
     const pal = new Uint8Array(256 * 4);
-    for (let i = 0; i < 256; i++) { const [r, g, b] = bandRGB(BAND0 + i); pal.set([r, g, b, 255], i * 4); }
+    for (let i = 0; i < 256; i++) { const c = bandRGB(BAND0 + i); pal.set(c ? [c[0], c[1], c[2], 255] : [0, 0, 0, 0], i * 4); }
     this.tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pal);
@@ -481,7 +495,8 @@ const labelLayer = (id, minzoom, maxzoom, filter) => ({
   id, type: "symbol", source: "t2m", "source-layer": "labels", minzoom, maxzoom: Math.min(maxzoom, tileLayerMax), filter,
   layout: {
     "symbol-placement": "line", "symbol-spacing": ["interpolate", ["linear"], ["zoom"], 3, 220, 10, 420],
-    "text-field": ["concat", ["number-format", ["*", ["get", "t"], STEP], { "min-fraction-digits": DEC, "max-fraction-digits": DEC }], isTemp ? "°" : "″"], "text-font": ["DejaVu Sans Bold"],
+    "text-field": ["concat", ["number-format", TH ? ["at", ["max", 0, ["get", "t"]], ["literal", TH]] : ["*", ["get", "t"], STEP],
+      TH ? { "max-fraction-digits": 1 } : { "min-fraction-digits": DEC, "max-fraction-digits": DEC }], isTemp ? "°" : "″"], "text-font": ["DejaVu Sans Bold"],
     "text-size": ["interpolate", ["linear"], ["zoom"], 3, 10, 10, 12.5], "text-max-angle": 40,
     "text-keep-upright": true, "text-rotation-alignment": "map", "text-padding": 4,
   },
@@ -489,7 +504,7 @@ const labelLayer = (id, minzoom, maxzoom, filter) => ({
 });
 const map = new maplibregl.Map({
   container: "map", antialias: true,
-  center: [-97.5, 38.6], zoom: window.innerWidth < 600 ? 2.6 : 3.9, minZoom: 2, maxZoom: 16,
+  center: meta.view?.center ?? [-97.5, 38.6], zoom: (meta.view?.zoom ?? 3.9) - (window.innerWidth < 600 ? 1.3 : 0), minZoom: 2, maxZoom: 16,
   renderWorldCopies: false, attributionControl: false, dragRotate: false, pitchWithRotate: false,
   maxBounds: [[-160, 5], [-35, 65]],
   style: {
@@ -505,16 +520,22 @@ const map = new maplibregl.Map({
       { id: "base", type: "fill", source: "t2m", "source-layer": "base", maxzoom: tileLayerMax,
         paint: { "fill-color": ["match", ["get", "t"], ...levelIds.flatMap((_, i) => [lo + i, rgbStr(bandRGB(lo + i))]), "#000"], "fill-antialias": false } },
       // one constant-colour layer per degree: MapLibre's opaque pass, GPU rejects hidden levels
-      ...levelIds.map((id, i) => ({
-        id, type: "fill", source: "t2m", "source-layer": "levels", maxzoom: tileLayerMax, filter: ["==", ["get", "t"], lo + i],
-        paint: { "fill-color": rgbStr(bandRGB(lo + i)), "fill-antialias": true },
+      ...levelIds.filter((_, i) => bandRGB(lo + i)).map((id) => ({
+        id, type: "fill", source: "t2m", "source-layer": "levels", maxzoom: tileLayerMax, filter: ["==", ["get", "t"], +id.slice(3)],
+        paint: { "fill-color": rgbStr(bandRGB(+id.slice(3))), "fill-antialias": true },
       })),
       { id: "coast", type: "line", source: "geo", filter: ["in", ["get", "kind"], ["literal", ["coast", "country"]]],
         paint: { "line-color": v("--border"), "line-width": zw([[3, 0.7], [8, 1.4], [12, 2]]) } },
       { id: "state", type: "line", source: "geo", filter: ["==", ["get", "kind"], "state"],
         paint: { "line-color": v("--border"), "line-width": zw([[3, 0.45], [8, 1], [12, 1.4]]), "line-dasharray": [3, 1.5] } },
-      labelLayer("lab10", 0, 5.5, ["==", ["%", ["get", "t"], 10], 0]),
-      labelLayer("lab5", 5.5, 8, ["==", ["%", ["get", "t"], 5], 0]),
+      ...(TH ? [
+        // uneven scale: a sparse set zoomed out, every legend value closer in
+        labelLayer("lab10", 0, 5.5, ["in", ["get", "t"], ["literal", [1, 2, 6, 10, 12, 18, 24, 36, 48].map((v) => TH.indexOf(v))]]),
+        labelLayer("lab5", 5.5, 8, ["in", ["get", "t"], ["literal", VAR.labels.map((v) => TH.indexOf(v))]]),
+      ] : [
+        labelLayer("lab10", 0, 5.5, ["==", ["%", ["get", "t"], 10], 0]),
+        labelLayer("lab5", 5.5, 8, ["==", ["%", ["get", "t"], 5], 0]),
+      ]),
     ],
   },
 });
@@ -525,7 +546,7 @@ const perfEl = document.getElementById("perf");
 
 // tile layers are hidden while playing (the WebGL layer draws every zoom then)
 function setTileLayers(on) {
-  for (const id of ["base", ...levelIds, "lab10", "lab5"]) map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
+  for (const id of ["base", ...levelIds, "lab10", "lab5"]) if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
 }
 
 // ------------------------------------------------------------------ timeline
@@ -533,35 +554,36 @@ const run = new Date(meta.run);
 const fmt = (d) => d.toLocaleString("en-US", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }) + "Z";
 document.getElementById("run").textContent = `Run ${fmt(run)} · f${hh(HOURS[0])}–f${hh(HOURS[HOURS.length - 1])}`;
 const slider = document.getElementById("hour"), validEl = document.getElementById("valid"), playBtn = document.getElementById("play");
-slider.min = HOURS[0]; slider.max = HOURS[HOURS.length - 1];
+slider.min = 0; slider.max = HOURS.length - 1; // slider moves over forecast steps
+document.getElementById("eyebrow").textContent = `${meta.model} · ${meta.grid || "CONUS 3 km"} · Forecast`;
 function showValid(t) {
   const d = new Date(run.getTime() + t * 3600e3);
-  validEl.innerHTML = `${fmt(d)}<small>+${t.toFixed(t % 1 ? 1 : 0)} h</small>`;
+  validEl.innerHTML = `${meta.accumulated ? "Total to " : ""}${fmt(d)}<small>+${t.toFixed(t % 1 ? 1 : 0)} h</small>`;
 }
 function setHour(h) {
-  hour = h; slider.value = h; showValid(h);
+  hour = h; slider.value = HOURS.indexOf(h); showValid(h);
   frame = { hA: h, hB: null, w: 0, px: STATIC_PX, coarse: false };
   map.getSource("t2m").setTiles([`hrrr://${h}/{z}/{x}/{y}`]);
   map.triggerRepaint();
   field(h).then(() => lastPt && readout(lastPt.point, lastPt.lngLat));
 }
-slider.addEventListener("input", () => setHour(+slider.value));
+slider.addEventListener("input", () => setHour(HOURS[+slider.value]));
 let lastTick = 0;
-const HOURS_PER_SEC = 1;
+const STEPS_PER_SEC = 1;
 function tick(now) {
   if (!playing) return;
   const dt = lastTick ? (now - lastTick) / 1000 : 0; lastTick = now;
-  playT += dt * HOURS_PER_SEC;
-  const last = HOURS[HOURS.length - 1];
-  if (playT >= last) playT = HOURS[0];
+  playT += dt * STEPS_PER_SEC; // in forecast-step units
+  if (playT >= HOURS.length - 1) playT = 0;
   // advance the requested frame only once the previous one is complete, so
   // slower devices simply show fewer in-between frames
   if (displayed === frameKey(frame)) {
     window.__live.frames++;
-    let hA = Math.floor(playT), w = Math.round((playT - hA) * 16) / 16;
-    if (w >= 1) { hA += 1; w = 0; }
-    frame = w === 0 || hA >= last ? { hA, hB: null, w: 0, px: PLAY_PX, coarse: true } : { hA, hB: hA + 1, w, px: PLAY_PX, coarse: true };
-    slider.value = hA; showValid(hA + w);
+    let i = Math.floor(playT), w = Math.round((playT - i) * 16) / 16;
+    if (w >= 1) { i += 1; w = 0; }
+    const hA = HOURS[i], hB = HOURS[i + 1];
+    frame = w === 0 || hB == null ? { hA, hB: null, w: 0, px: PLAY_PX, coarse: true } : { hA, hB, w, px: PLAY_PX, coarse: true };
+    slider.value = i; showValid(hB == null ? hA : hA + w * (hB - hA));
     map.triggerRepaint();
   }
   requestAnimationFrame(tick);
@@ -572,32 +594,39 @@ playBtn.addEventListener("click", () => {
   playBtn.setAttribute("aria-label", playing ? "Pause forecast" : "Play forecast");
   if (playing) {
     HOURS.forEach(field); // prefetch every hour
-    playT = hour; lastTick = 0; setTileLayers(false);
+    playT = HOURS.indexOf(hour); lastTick = 0; setTileLayers(false);
     requestAnimationFrame(tick);
   } else {
     setTileLayers(true);
-    setHour(Math.round(playT) > HOURS[HOURS.length - 1] ? HOURS[0] : Math.round(playT));
+    setHour(HOURS[Math.min(HOURS.length - 1, Math.round(playT))]);
   }
 });
 showValid(hour);
 
 // ------------------------------------------------------------------ legend + readout
 document.getElementById("title").textContent = VAR.name;
-document.title = `HRRR ${VAR.short}`;
-document.getElementById("legend-title").textContent = `${VAR.short} ${UNIT} · ${fmtV(STEP)}${isTemp ? "°" : " " + UNIT} bands`;
-document.getElementById("credit-bands").textContent = `Vector bands every ${fmtV(STEP)} ${UNIT}.`;
-document.getElementById("range").textContent = `${fmtV(meta.vmin)} to ${fmtV(meta.vmax)} ${UNIT} this run`;
-// legend in band units; ticks every VAR.ticks display units
-const TICK = Math.round(VAR.ticks / STEP);
-const lgLo = Math.floor(meta.tmin / TICK) * TICK, lgHi = Math.ceil(meta.tmax / TICK) * TICK;
+document.title = `${meta.model} ${VAR.short}`;
+document.getElementById("legend-title").textContent = TH
+  ? `${VAR.short} ${UNIT}${meta.var.id === "snow" ? " · 10:1 ratio" : ""}`
+  : `${VAR.short} ${UNIT} · ${fmtV(STEP)}${isTemp ? "°" : " " + UNIT} bands`;
+document.getElementById("credit-bands").textContent = TH
+  ? `Vector bands at ${TH[0]}, ${TH[1]}, ${TH[2]} … ${TH[TH.length - 1]} ${UNIT}.`
+  : `Vector bands every ${fmtV(STEP)} ${UNIT}.`;
+document.getElementById("range").textContent = TH
+  ? `max ${fmtV(meta.vmax)} ${UNIT}` : `${fmtV(meta.vmin)} to ${fmtV(meta.vmax)} ${UNIT} this run`;
+// legend in band units: one pixel per band
+const TICK = TH ? 1 : Math.round(VAR.ticks / STEP);
+const lgLo = TH ? 0 : Math.floor(meta.tmin / TICK) * TICK, lgHi = TH ? TH.length - 1 : Math.ceil(meta.tmax / TICK) * TICK;
 const bc = document.getElementById("barc"), bctx = bc.getContext("2d");
 bc.width = lgHi - lgLo; bc.style.imageRendering = "pixelated";
 for (let b = lgLo; b < lgHi; b++) { bctx.fillStyle = rgbStr(bandRGB(b)); bctx.fillRect(b - lgLo, 0, 1, 1); }
 const ticks = document.getElementById("ticks");
-const pos = (b) => `${((b - lgLo) / (lgHi - lgLo)) * 100}%`;
+const pos = (b) => `${((Math.max(lgLo, Math.min(lgHi, b)) - lgLo) / (lgHi - lgLo)) * 100}%`;
 const hl = VAR.highlight == null ? null : VAR.highlight / STEP;
+const tickBands = TH ? [0, 2, 4, 8, 12, 16, 20, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58].filter((b) => b <= lgHi) : null;
 for (let b = lgLo; b <= lgHi; b += TICK) {
-  const s = document.createElement("span"); s.style.left = pos(b); s.textContent = +(b * STEP).toFixed(DEC); ticks.append(s);
+  if (tickBands && !tickBands.includes(b)) continue;
+  const s = document.createElement("span"); s.style.left = pos(b); s.textContent = TH ? TH[b] : +(b * STEP).toFixed(DEC); ticks.append(s);
   if (hl != null && Math.abs(b - hl) < TICK / 2) s.style.visibility = "hidden"; // make room for the highlight tick
 }
 if (hl != null && hl > lgLo && hl < lgHi) {
@@ -617,16 +646,19 @@ async function readout(point, lngLat) {
   lastPt = { point, lngLat };
   const f = frame, A = await field(f.hA), B = f.hB == null ? null : await field(f.hB);
   const t = sample(grid, B ? [A, B] : [A], f.w, lngLat.lng, lngLat.lat);
-  if (t == null) { val.innerHTML = "––"; sub.innerHTML = "Outside the<br>HRRR domain"; cur.style.display = "none"; return; }
-  const v = t * STEP, b = Math.floor(t);
-  const alt = isTemp ? `${((v - 32) * 5 / 9).toFixed(1)} °C` : `${(v * 25.4).toFixed(1)} mm`;
-  val.innerHTML = `${fmtV(v, 1)}<small>${UNIT}</small>`;
-  sub.innerHTML = `${alt} · band ${fmtV(b * STEP)}–${fmtV((b + 1) * STEP)}<br>${Math.abs(lngLat.lat).toFixed(2)}°${lngLat.lat >= 0 ? "N" : "S"} ${Math.abs(lngLat.lng).toFixed(2)}°${lngLat.lng >= 0 ? "E" : "W"}`;
+  if (t == null) { val.innerHTML = "––"; sub.innerHTML = `Outside the<br>${meta.model} domain`; cur.style.display = "none"; return; }
+  const v = toValue(t), b = Math.floor(t);
+  const alt = isTemp ? `${((v - 32) * 5 / 9).toFixed(1)} °C` : VAR.alt ? `${(v * VAR.alt.factor).toFixed(1)} ${VAR.alt.units}` : `${(v * 25.4).toFixed(1)} mm`;
+  val.innerHTML = `${fmtV(v, TH ? 0 : 1)}<small>${UNIT}</small>`;
+  sub.innerHTML = `${alt} · band ${bandText(b)}<br>${Math.abs(lngLat.lat).toFixed(2)}°${lngLat.lat >= 0 ? "N" : "S"} ${Math.abs(lngLat.lng).toFixed(2)}°${lngLat.lng >= 0 ? "E" : "W"}`;
   cur.style.display = "block"; cur.style.left = pos(t);
 }
 map.on("mousemove", (e) => { if (pendingRO) return; pendingRO = requestAnimationFrame(() => { pendingRO = null; readout(e.point, e.lngLat); }); });
 map.on("click", (e) => readout(e.point, e.lngLat));
+document.getElementById("credit-model").textContent = meta.model + (VAR.id === "snow" ? " (10:1 snowfall from precipitation × categorical snow)" : "");
+if (meta.model === "GFS") document.getElementById("credit-link").href = "https://registry.opendata.aws/noaa-gfs-bdp-pds/";
 const zl = document.getElementById("zl");
+zl.textContent = `z ${map.getZoom().toFixed(1)}`;
 map.on("zoom", () => { zl.textContent = `z ${map.getZoom().toFixed(1)}`; });
 document.getElementById("zin").onclick = () => map.zoomIn();
 document.getElementById("zout").onclick = () => map.zoomOut();

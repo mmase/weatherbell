@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import { Grid, contourTile } from "./contour.js";
-const dir = new URL("./run/grids/", import.meta.url);
+const dir = new URL("./run/t2m/grids/", import.meta.url);
 const meta = JSON.parse(readFileSync(new URL("meta.json", dir)));
 const load = (h) => { const b = gunzipSync(readFileSync(new URL(`f${String(h).padStart(2, "0")}.i16.gz`, dir))); const d = new Int16Array(b.buffer, b.byteOffset, b.length / 2); for (let r = 0; r < meta.ny; r++) for (let c = 1, o = r * meta.nx; c < meta.nx; c++) d[o + c] += d[o + c - 1]; return d; };
 let t = performance.now();

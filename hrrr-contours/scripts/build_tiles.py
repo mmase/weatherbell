@@ -54,6 +54,7 @@ MINZOOM, MAXZOOM = 2, 9
 LEVEL_EPS = 1e-4  # contour levels sit this far below each integer (see build_tile)
 TOPZOOM = 9  # the zoom MapLibre overzooms to z13 when tiles are the only renderer
 LABEL_ALL_ZOOM = 7  # from this zoom every 1-degree isoline gets a label line
+LABEL_LEVELS = None  # optional set of band levels to label (overrides the rule above)
 LABEL_TOLERANCE = 40  # tile units (~2.5 px) for the label-only line layer
 # Fill simplification, in screen px at the tile's own zoom.  Levels are stacked
 # (see below), so each polygon can be simplified independently without opening
@@ -134,8 +135,13 @@ def load_grid(path):
     d = np.frombuffer(gzip.decompress(open(path, "rb").read()), dtype="<i2").reshape(meta["ny"], meta["nx"])
     q = np.cumsum(d, axis=1, dtype=np.int16)  # undo row deltas (wrapping int16 arithmetic)
     p = meta["proj"]
-    proj = (f"+proj=lcc +lon_0={p['lon0']} +lat_0={p['lat0']} +lat_1={p['lat1']} +lat_2={p['lat2']} "
-            f"+R={p['R']}")
+    if p["type"] == "latlon":  # x0/y0/dx in degrees; "projected" coords are lon/lat
+        proj = f"+proj=longlat +R={p['R']} +no_defs"
+        Field.cell_m = meta["dx"] * 111320 * math.cos(math.radians(p["lat0"]))
+    else:
+        proj = (f"+proj=lcc +lon_0={p['lon0']} +lat_0={p['lat0']} +lat_1={p['lat1']} +lat_2={p['lat2']} "
+                f"+R={p['R']}")
+        Field.cell_m = meta["dx"]
     return q.astype(np.float64) / meta["scale"], proj, meta["x0"], meta["y0"], meta["dx"]
 
 
@@ -148,12 +154,15 @@ class Field:
         self.to_merc = WebMercator(self.proj, inverse=False)
         self.to_lcc = WebMercator(self.proj, inverse=True)
 
+    cell_m = 3000.0  # nominal grid cell size in metres (set per source)
+
     def spacing(self, z):
-        # ~1.6 px per lattice step at every zoom; the top zoom is twice as dense
-        # because it is also what MapLibre overzooms (up to 16x) beyond z9.
-        # Never coarser than the native 3 km grid, so no model feature is
-        # smoothed away at low zooms.
-        return 1.0 / 32.0 if z == TOPZOOM else min(1.0, 2.0 ** (TOPZOOM - z) / 16.0)
+        # ~1.6 px per lattice step at every zoom, never coarser than the grid
+        # (so no model feature is smoothed away at low zooms); the top zoom is
+        # twice as dense because MapLibre overzooms it up to z13.
+        mpp = 40075016.686 * math.cos(math.radians(38.5)) / (512 * 2 ** z)
+        s = min(1.0, 2.0 ** round(math.log2(1.6 * mpp / self.cell_m)))
+        return s / 2 if z == TOPZOOM else s
 
     def lattice(self, z, i0, i1, j0, j1):
         """Field values on the global lattice restricted to grid-index box."""
@@ -387,9 +396,10 @@ def ragged(geoms, kind):
 FIELD = None
 
 
-def init_worker(path):
-    global FIELD
+def init_worker(path, label_levels=None):
+    global FIELD, LABEL_LEVELS
     FIELD = Field(path)
+    LABEL_LEVELS = label_levels
 
 
 def tile_bounds(z, x, y):
@@ -434,7 +444,7 @@ def build_tile(zxy):
         if pts is not None:
             fills.append((t, pts, offs, outer))
         # Isolines for text placement only (every 5 deg at low zoom).
-        if t > lo and (t % 5 == 0 or z >= LABEL_ALL_ZOOM):
+        if t > lo and (t in LABEL_LEVELS if LABEL_LEVELS is not None else (t % 5 == 0 or z >= LABEL_ALL_ZOOM)):
             lp, lo_ = (c[0] for c in gen.lines(t - LEVEL_EPS))
             if lp is not None:
                 lines.append((t, lp, lo_))
@@ -515,7 +525,7 @@ def domain_tiles(fld, z):
     return [(z, x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
 
-def build(source, out, minzoom=MINZOOM, maxzoom=MAXZOOM, workers=None, log=True, pack=None):
+def build(source, out, minzoom=MINZOOM, maxzoom=MAXZOOM, workers=None, log=True, pack=None, label_levels=None):
     """Build zooms minzoom..maxzoom from a GRIB2 file or a published grid into
     pack files in `out`.  Returns (tiles, packs, bytes, seconds)."""
     t0 = time.time()
@@ -526,7 +536,7 @@ def build(source, out, minzoom=MINZOOM, maxzoom=MAXZOOM, workers=None, log=True,
     jobs.sort(key=lambda t: t[0])
     packs = {}
     nbytes = 0
-    with Pool(workers or os.cpu_count(), initializer=init_worker, initargs=(source,)) as pool:
+    with Pool(workers or os.cpu_count(), initializer=init_worker, initargs=(source, label_levels)) as pool:
         for n, (zxy, data) in enumerate(pool.imap_unordered(build_tile, jobs, chunksize=2)):
             if data:
                 packs.setdefault((pack or pack_key)(*zxy), []).append((zxy, data))

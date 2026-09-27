@@ -24,6 +24,9 @@ export class Grid {
     this.meta = meta;
     const { nx, ny, dx, x0, y0, proj } = meta;
     this.nx = nx; this.ny = ny; this.dx = dx; this.x0 = x0; this.y0 = y0;
+    this.latlon = proj.type === "latlon"; // x0/y0/dx in degrees, rows south -> north
+    // nominal cell size in metres (sets the lattice density per zoom)
+    this.cellM = this.latlon ? dx * 111320 * Math.cos(proj.lat0 * D2R) : dx;
     // Lambert conformal conic on a sphere (HRRR/NAM style); lat1 == lat2 is the tangent case.
     const R = proj.R, p1 = proj.lat1 * D2R, p2 = proj.lat2 * D2R, p0 = proj.lat0 * D2R;
     const n = Math.abs(p1 - p2) < 1e-10 ? Math.sin(p1)
@@ -48,6 +51,10 @@ export class Grid {
 
   // grid node (fractional allowed) -> web mercator 0..1
   nodeMerc(i, j) {
+    if (this.latlon) {
+      const lon = this.x0 + i * this.dx, lat = this.y0 + j * this.dx;
+      return [lon / 360 + 0.5, 0.5 - Math.log(Math.tan(Math.PI / 4 + lat * D2R / 2)) / (2 * Math.PI)];
+    }
     const { R, n, F, rho0, lon0 } = this.lcc;
     const x = this.x0 + i * this.dx, y = this.y0 + j * this.dx;
     const dy = rho0 - y;
@@ -60,6 +67,7 @@ export class Grid {
 
   // lon/lat (degrees) -> fractional grid index
   lonLatToIJ(lon, lat) {
+    if (this.latlon) return [(lon - this.x0) / this.dx, (lat - this.y0) / this.dx];
     const { R, n, F, rho0, lon0 } = this.lcc;
     const rho = R * F / Math.pow(Math.tan(Math.PI / 4 + lat * D2R / 2), n);
     let dl = lon * D2R - lon0;
@@ -72,7 +80,7 @@ export class Grid {
   // domain's reference latitude, rounded to a power of two, at most 1 cell
   step(z, spacingPx, allowCoarse = false) {
     const mPerPx = WORLD * Math.cos(this.meta.proj.lat0 * D2R) / (512 * 2 ** z);
-    const s = 2 ** Math.round(Math.log2(spacingPx * mPerPx / this.dx));
+    const s = 2 ** Math.round(Math.log2(spacingPx * mPerPx / this.cellM));
     return Math.min(allowCoarse ? 8 : 1, s);
   }
 }
