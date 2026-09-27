@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HRRR Isotherm Map</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,400..700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --panel: rgba(246, 248, 250, 0.92);
+  --panel-solid: #f6f8fa;
+  --ink: #15202b;
+  --muted: #5a6776;
+  --rule: #d3dae2;
+  --accent: #1d6fd1;
+  --water: #c9d6e0;
+  --land: #e4e6e1;
+  --border: rgba(18, 24, 33, 0.62);
+  --contour: rgba(20, 24, 32, 0.5);
+  --label: #121821;
+  --halo: rgba(255, 255, 255, 0.78);
+  --ui: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --panel: rgba(16, 21, 28, 0.9);
+    --panel-solid: #10151c;
+    --ink: #e5eaf0;
+    --muted: #8e9bab;
+    --rule: #28313d;
+    --accent: #6eaaf5;
+    --water: #0c1117;
+    --land: #1a1f26;
+    --border: rgba(10, 12, 16, 0.75);
+    --contour: rgba(12, 14, 20, 0.55);
+    --label: #0d1117;
+    --halo: rgba(255, 255, 255, 0.7);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --panel: rgba(16, 21, 28, 0.9);
+  --panel-solid: #10151c;
+  --ink: #e5eaf0;
+  --muted: #8e9bab;
+  --rule: #28313d;
+  --accent: #6eaaf5;
+  --water: #0c1117;
+  --land: #1a1f26;
+  --border: rgba(10, 12, 16, 0.75);
+  --contour: rgba(12, 14, 20, 0.55);
+  --label: #0d1117;
+  --halo: rgba(255, 255, 255, 0.7);
+}
+html, body { height: 100%; margin: 0; }
+body { background: var(--water); color: var(--ink); font: 14px/1.4 var(--ui); overflow: hidden; }
+#map { position: absolute; inset: 0; }
+
+/* the few MapLibre rules the page needs (its stylesheet is not loaded) */
+.maplibregl-map { overflow: hidden; position: relative; -webkit-tap-highlight-color: transparent; }
+.maplibregl-canvas { position: absolute; left: 0; top: 0; }
+.maplibregl-canvas-container.maplibregl-interactive { cursor: crosshair; }
+.maplibregl-canvas-container.maplibregl-interactive:active { cursor: grabbing; }
+.maplibregl-ctrl-bottom-left, .maplibregl-ctrl-bottom-right, .maplibregl-ctrl-top-left, .maplibregl-ctrl-top-right { display: none; }
+
+.panel {
+  position: absolute; z-index: 2;
+  background: var(--panel); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--rule); border-radius: 6px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.08), 0 6px 24px rgba(0,0,0,.10);
+}
+#info {
+  top: calc(16px + env(safe-area-inset-top, 0px)); left: 16px;
+  width: min(292px, calc(100vw - 32px)); padding: 14px 16px 12px;
+  display: grid; gap: 10px;
+}
+.eyebrow { font: 600 11px/1 var(--ui); font-stretch: 80%; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing: -.005em; text-wrap: balance; }
+.run { font: 400 12px/1.35 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.readout { display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: 2px 12px; padding-top: 10px; border-top: 1px solid var(--rule); }
+#val { font: 500 30px/1 var(--mono); letter-spacing: -.02em; font-variant-numeric: tabular-nums; min-width: 5.2ch; }
+#val small { font-size: 15px; color: var(--muted); margin-left: 1px; }
+#sub { font: 400 12px/1.35 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.toggles { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  font: 500 12px/1 var(--ui); font-stretch: 88%; color: var(--ink);
+  background: transparent; border: 1px solid var(--rule); border-radius: 999px;
+  padding: 6px 10px 6px 8px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+}
+.chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--muted); }
+.chip[aria-pressed="true"]::before { background: var(--accent); border-color: var(--accent); }
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.credit { font-size: 11px; color: var(--muted); line-height: 1.35; }
+.credit a { color: inherit; }
+
+#legend {
+  left: 50%; transform: translateX(-50%);
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  width: min(640px, calc(100vw - 32px)); padding: 10px 14px 8px; box-sizing: border-box;
+}
+#legend .head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+#bar { position: relative; height: 14px; border-radius: 2px; }
+#bar canvas { width: 100%; height: 100%; display: block; border-radius: 2px; }
+#cursor { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--ink); box-shadow: 0 0 0 1.5px var(--panel-solid); display: none; }
+#ticks { position: relative; height: 16px; margin-top: 3px; font: 400 11px/16px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+#ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+#ticks span.frz { color: var(--accent); font-weight: 500; }
+
+#zoom { position: absolute; z-index: 2; right: 16px; top: calc(16px + env(safe-area-inset-top, 0px)); display: grid; }
+#zoom button { width: 34px; height: 34px; font: 500 18px/1 var(--mono); color: var(--ink); background: var(--panel); border: 1px solid var(--rule); cursor: pointer; }
+#zoom button:first-child { border-radius: 6px 6px 0 0; border-bottom: none; }
+#zoom button:last-child { border-radius: 0 0 6px 6px; }
+#zoom button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+#zl { position: absolute; z-index: 2; right: 16px; top: calc(92px + env(safe-area-inset-top, 0px)); font: 400 11px var(--mono); color: var(--muted); background: var(--panel); padding: 3px 6px; border-radius: 4px; border: 1px solid var(--rule); }
+
+@media (max-width: 560px) {
+  #info { padding: 10px 12px; gap: 8px; width: calc(100vw - 32px - 50px); }
+  h1 { font-size: 17px; }
+  #val { font-size: 24px; }
+  .credit { display: none; }
+}
+</style>
+</head>
+<body>
+<div id="map" role="application" aria-label="Map of HRRR 2 metre temperature with 1 degree contours"></div>
+
+<section id="info" class="panel" aria-live="polite">
+  <div>
+    <div class="eyebrow">HRRR · CONUS 3 km</div>
+    <h1>2 m Air Temperature</h1>
+    <div class="run" id="run">Loading…</div>
+  </div>
+  <div class="readout">
+    <div id="val">––<small>°F</small></div>
+    <div id="sub">Hover or tap<br>the map</div>
+  </div>
+  <div class="toggles">
+    <button class="chip" id="t-lines" aria-pressed="true">Isotherms</button>
+    <button class="chip" id="t-labels" aria-pressed="true">Labels</button>
+    <button class="chip" id="t-borders" aria-pressed="true">Borders</button>
+  </div>
+  <div class="credit">Vector contours every 1&nbsp;°F. Data: NOAA/NCEP HRRR via <a href="https://registry.opendata.aws/noaa-hrrr-pds/" target="_blank" rel="noopener">AWS Open Data</a>. Boundaries: Natural Earth, US Census.</div>
+</section>
+
+<div id="zoom"><button id="zin" aria-label="Zoom in">+</button><button id="zout" aria-label="Zoom out">−</button></div>
+<div id="zl">z 4.0</div>
+
+<section id="legend" class="panel" aria-label="Temperature colour scale">
+  <div class="head"><span class="eyebrow">Temperature °F · 1° bands</span><span class="eyebrow" id="range"></span></div>
+  <div id="bar"><canvas id="barc" width="600" height="1"></canvas><div id="cursor"></div></div>
+  <div id="ticks"></div>
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.9.0/dist/maplibre-gl.js"></script>
+<script>
+(async () => {
+  // ---------------------------------------------------------------- colour scale (°F)
+  const STOPS = [
+    [-40, "#f1e6f5"], [-20, "#c7a4d8"], [0, "#7b4fa6"], [10, "#4b3f9e"], [20, "#2c5aa8"],
+    [32, "#3d93d1"], [40, "#72c6cf"], [50, "#58b37a"], [60, "#9ccb52"], [70, "#eadb55"],
+    [80, "#f5a940"], [90, "#e66a31"], [100, "#c42a2c"], [110, "#8e1239"], [120, "#e6a3c3"],
+  ];
+  const colorExpr = ["interpolate-lab", ["linear"], ["+", ["get", "t"], 0.5], ...STOPS.flat()];
+  const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+  function colorAt(v) { // for the legend canvas (sRGB lerp is close enough at this size)
+    let i = STOPS.findIndex((s) => s[0] > v);
+    if (i <= 0) return hex(STOPS[i === 0 ? 0 : STOPS.length - 1][1]);
+    const [a, ca] = STOPS[i - 1], [b, cb] = STOPS[i], f = (v - a) / (b - a);
+    const A = hex(ca), B = hex(cb);
+    return A.map((x, k) => Math.round(x + (B[k] - x) * f));
+  }
+
+  // ---------------------------------------------------------------- tile packs
+  // Tiles are gzipped MVT grouped into pack files: [u32 n][n x (z,x,y,off,len)][data].
+  const meta = await (await fetch("tiles/meta.json")).json();
+  const havePack = new Set(meta.packs);
+  const packKey = (z, x, y) => {
+    if (z <= 4) return `${z}-0-0`;
+    const r = z <= 6 ? 5 : 7;
+    return `${r}-${x >> (z - r)}-${y >> (z - r)}`;
+  };
+  const packs = new Map(); // key -> Promise<{buf, index}>, LRU by insertion order
+  function getPack(key) {
+    let p = packs.get(key);
+    if (p) { packs.delete(key); packs.set(key, p); return p; }
+    p = fetch(`tiles/${key}.bin`).then((r) => {
+      if (!r.ok) throw new Error(`pack ${key}: HTTP ${r.status}`);
+      return r.arrayBuffer();
+    }).then((buf) => {
+      const dv = new DataView(buf), n = dv.getUint32(0, true), index = new Map();
+      for (let i = 0, o = 4; i < n; i++, o += 20)
+        index.set(`${dv.getUint32(o, true)}/${dv.getUint32(o + 4, true)}/${dv.getUint32(o + 8, true)}`,
+                  [dv.getUint32(o + 12, true), dv.getUint32(o + 16, true)]);
+      return { buf, index };
+    });
+    p.catch(() => packs.delete(key));
+    packs.set(key, p);
+    while (packs.size > 48) packs.delete(packs.keys().next().value);
+    return p;
+  }
+  const EMPTY = new ArrayBuffer(0);
+  maplibregl.addProtocol("hrrr", async (params) => {
+    const [z, x, y] = params.url.slice(7).split("/").map(Number);
+    const key = packKey(z, x, y);
+    if (!havePack.has(key)) return { data: EMPTY };
+    const { buf, index } = await getPack(key);
+    const e = index.get(`${z}/${x}/${y}`);
+    if (!e) return { data: EMPTY };
+    const stream = new Blob([new Uint8Array(buf, e[0], e[1])]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return { data: await new Response(stream).arrayBuffer() };
+  });
+  ["2-0-0", "3-0-0", "4-0-0"].forEach((k) => havePack.has(k) && getPack(k)); // warm the overview packs
+
+  // ---------------------------------------------------------------- style
+  const css = () => { const s = getComputedStyle(document.documentElement); return (n) => s.getPropertyValue(n).trim(); };
+  const v = css();
+  const abs = (p) => new URL(p, location.href).href;
+  const zw = (pairs) => ["interpolate", ["exponential", 1.6], ["zoom"], ...pairs.flat()];
+  const major = ["==", ["%", ["get", "t"], 10], 0];
+  const labelLayer = (id, minzoom, maxzoom, filter) => ({
+    id, type: "symbol", source: "t2m", "source-layer": "labels", minzoom, maxzoom, filter,
+    layout: {
+      "symbol-placement": "line", "symbol-spacing": ["interpolate", ["linear"], ["zoom"], 3, 220, 10, 420],
+      "text-field": ["concat", ["to-string", ["get", "t"]], "°"], "text-font": ["DejaVu Sans Bold"],
+      "text-size": ["interpolate", ["linear"], ["zoom"], 3, 10, 10, 12.5], "text-max-angle": 40,
+      "text-keep-upright": true, "text-rotation-alignment": "map", "text-padding": 4,
+    },
+    paint: { "text-color": v("--label"), "text-halo-color": v("--halo"), "text-halo-width": 1.4, "text-halo-blur": 0.4 },
+  });
+
+  const map = new maplibregl.Map({
+    container: "map",
+    center: [-97.5, 38.6], zoom: window.innerWidth < 600 ? 2.6 : 3.9, minZoom: 2, maxZoom: 13,
+    renderWorldCopies: false, attributionControl: false, dragRotate: false, pitchWithRotate: false,
+    maxBounds: [[-160, 5], [-35, 65]],
+    style: {
+      version: 8,
+      glyphs: abs("glyphs/") + "{fontstack}/{range}.pbf",
+      sources: {
+        t2m: { type: "vector", tiles: ["hrrr://{z}/{x}/{y}"], minzoom: meta.minzoom, maxzoom: meta.maxzoom },
+        geo: { type: "geojson", data: abs("boundaries.json"), tolerance: 0.25 },
+      },
+      layers: [
+        { id: "bg", type: "background", paint: { "background-color": v("--water") } },
+        { id: "land", type: "fill", source: "geo", filter: ["==", ["get", "kind"], "land"], paint: { "fill-color": v("--land") } },
+        // Stacked superlevel sets: the base footprint, then {T >= t} for ascending t.
+        { id: "base", type: "fill", source: "t2m", "source-layer": "base", paint: { "fill-color": colorExpr, "fill-antialias": false } },
+        { id: "levels", type: "fill", source: "t2m", "source-layer": "levels", paint: { "fill-color": colorExpr, "fill-antialias": true } },
+        { id: "iso", type: "line", source: "t2m", "source-layer": "levels", filter: ["!=", ["get", "t"], 32],
+          layout: { "line-join": "round", "line-cap": "round" },
+          paint: { "line-color": v("--contour"),
+                   "line-width": zw([[3, ["case", major, 0.45, 0.18]], [7, ["case", major, 0.9, 0.45]], [12, ["case", major, 1.8, 1.0]]]),
+                   "line-opacity": ["interpolate", ["linear"], ["zoom"], 3, 0.55, 7, 0.8, 12, 0.9] } },
+        { id: "freezing", type: "line", source: "t2m", "source-layer": "levels", filter: ["==", ["get", "t"], 32],
+          layout: { "line-join": "round", "line-cap": "round" },
+          paint: { "line-color": "#ffffff", "line-width": zw([[3, 0.9], [7, 1.6], [12, 3]]), "line-opacity": 0.95 } },
+        { id: "coast", type: "line", source: "geo", filter: ["in", ["get", "kind"], ["literal", ["coast", "country"]]],
+          paint: { "line-color": v("--border"), "line-width": zw([[3, 0.7], [8, 1.4], [12, 2]]) } },
+        { id: "state", type: "line", source: "geo", filter: ["==", ["get", "kind"], "state"],
+          paint: { "line-color": v("--border"), "line-width": zw([[3, 0.45], [8, 1], [12, 1.4]]), "line-dasharray": [3, 1.5] } },
+        labelLayer("lab10", 0, 5.5, ["==", ["%", ["get", "t"], 10], 0]),
+        labelLayer("lab5", 5.5, 8, ["==", ["%", ["get", "t"], 5], 0]),
+        labelLayer("lab1", 8, 24, true),
+      ],
+    },
+  });
+
+  // Theme changes: repaint the non-data colours from the CSS tokens.
+  function applyTheme() {
+    const v = css();
+    map.setPaintProperty("bg", "background-color", v("--water"));
+    map.setPaintProperty("land", "fill-color", v("--land"));
+    map.setPaintProperty("iso", "line-color", v("--contour"));
+    for (const id of ["coast", "state"]) map.setPaintProperty(id, "line-color", v("--border"));
+    for (const id of ["lab10", "lab5", "lab1"]) { map.setPaintProperty(id, "text-color", v("--label")); map.setPaintProperty(id, "text-halo-color", v("--halo")); }
+    document.body.style.background = v("--water");
+  }
+  map.once("load", () => {
+    matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
+    new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  });
+
+  // ---------------------------------------------------------------- UI
+  const run = new Date(meta.run);
+  document.getElementById("run").textContent =
+    `${run.toLocaleString("en-US", { weekday: "short", day: "numeric", month: "short", year: "numeric", timeZone: "UTC" })} · ${String(run.getUTCHours()).padStart(2, "0")}Z analysis`;
+  document.getElementById("range").textContent = `${meta.tmin}° to ${meta.tmax}°`;
+
+  // legend
+  const lo = Math.floor(meta.tmin / 10) * 10 - 0, hi = Math.ceil(meta.tmax / 10) * 10;
+  const bc = document.getElementById("barc"), bctx = bc.getContext("2d");
+  bc.width = (hi - lo); // one pixel per degree: the bar shows the 1° bands themselves
+  for (let t = lo; t < hi; t++) { const [r, g, b] = colorAt(t + 0.5); bctx.fillStyle = `rgb(${r},${g},${b})`; bctx.fillRect(t - lo, 0, 1, 1); }
+  bc.style.imageRendering = "pixelated";
+  const ticks = document.getElementById("ticks");
+  const pos = (t) => `${((t - lo) / (hi - lo)) * 100}%`;
+  for (let t = lo; t <= hi; t += 10) {
+    const s = document.createElement("span"); s.style.left = pos(t); s.textContent = t; ticks.append(s);
+  }
+  if (32 > lo && 32 < hi) { const s = document.createElement("span"); s.className = "frz"; s.style.left = pos(32); s.textContent = "32"; s.style.top = "0"; ticks.append(s); }
+  // keep the 32 tick from colliding with 30
+  [...ticks.children].forEach((s) => { if (+s.textContent === 30 && s.className !== "frz" && 32 > lo && 32 < hi) s.style.visibility = "hidden"; });
+
+  // readout: the band at a point is the highest superlevel polygon that contains it
+  const val = document.getElementById("val"), sub = document.getElementById("sub"), cur = document.getElementById("cursor");
+  let pending = null;
+  function readout(pt, lngLat) {
+    const fs = map.queryRenderedFeatures(pt, { layers: ["base", "levels"] });
+    if (!fs.length) {
+      val.innerHTML = "––<small>°F</small>"; sub.innerHTML = "Outside the<br>HRRR domain"; cur.style.display = "none"; return;
+    }
+    const t = Math.max(...fs.map((f) => f.properties.t));
+    const c = (f) => ((f - 32) * 5 / 9).toFixed(1);
+    val.innerHTML = `${t}–${t + 1}<small>°F</small>`;
+    sub.innerHTML = `${c(t)} to ${c(t + 1)} °C<br>${Math.abs(lngLat.lat).toFixed(2)}°${lngLat.lat >= 0 ? "N" : "S"} ${Math.abs(lngLat.lng).toFixed(2)}°${lngLat.lng >= 0 ? "E" : "W"}`;
+    cur.style.display = "block"; cur.style.left = pos(t + 0.5);
+  }
+  const onMove = (e) => {
+    if (pending) return;
+    pending = requestAnimationFrame(() => { pending = null; readout(e.point, e.lngLat); });
+  };
+  map.on("mousemove", onMove);
+  map.on("click", (e) => readout(e.point, e.lngLat));
+
+  const zl = document.getElementById("zl");
+  map.on("zoom", () => { zl.textContent = `z ${map.getZoom().toFixed(1)}`; });
+  document.getElementById("zin").onclick = () => map.zoomIn();
+  document.getElementById("zout").onclick = () => map.zoomOut();
+
+  const toggles = { "t-lines": ["iso", "freezing"], "t-labels": ["lab10", "lab5", "lab1"], "t-borders": ["coast", "state"] };
+  for (const [id, layers] of Object.entries(toggles)) {
+    const b = document.getElementById(id);
+    b.onclick = () => {
+      const on = b.getAttribute("aria-pressed") !== "true";
+      b.setAttribute("aria-pressed", on);
+      layers.forEach((l) => map.setLayoutProperty(l, "visibility", on ? "visible" : "none"));
+    };
+  }
+  window.map = map;
+})();
+</script>
+</body>
+</html>

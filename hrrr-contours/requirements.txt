@@ -1,0 +1,8 @@
+numpy
+scipy
+contourpy
+shapely
+pyproj
+eccodes
+eccodeslib
+pillow
