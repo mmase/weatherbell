@@ -297,11 +297,16 @@ let frame = { hA: hour, hB: null, w: 0, px: STATIC_PX, coarse: false };
 const frameKey = (f) => `${f.hA}|${f.hB}|${f.w.toFixed(3)}|${f.px}`;
 
 // ------------------------------------------------------------------ WebGL layer
-const VS = `#version 300 es
+// Vertex shader built on MapLibre's own projection code (shaderData prelude),
+// so tiles project correctly on flat Mercator, on the globe, and in between.
+// a_pos is tile-local (uint16 -> 0..1 maps to -0.25..1.75 tiles); projectTile()
+// takes tile units 0..8192 with per-tile uniforms from getProjectionData().
+const makeVS = (sd) => `#version 300 es
+${sd.vertexShaderPrelude}
+${sd.define}
 in vec2 a_pos; in int a_band;
-uniform mat4 u_matrix;
 flat out int v_band;
-void main() { gl_Position = u_matrix * vec4(a_pos * 2.0 - 0.25, 0.0, 1.0); v_band = a_band; }`;
+void main() { gl_Position = projectTile((a_pos * 2.0 - 0.25) * 8192.0); v_band = a_band; }`;
 const FS = `#version 300 es
 precision highp float;
 flat in int v_band; uniform sampler2D u_pal; out vec4 color;
@@ -335,16 +340,26 @@ function visibleTiles(map, f) {
 
 const live = {
   id: "live", type: "custom", renderingMode: "2d",
-  onAdd(map, gl) {
-    this.map = map; this.gl = gl;
+  program(sd) {
+    // one program per MapLibre projection variant (mercator / globe)
+    this.programs ??= new Map();
+    if (this.programs.has(sd.variantName)) return this.programs.get(sd.variantName);
+    const gl = this.gl;
     const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
       if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
     const p = gl.createProgram();
-    gl.attachShader(p, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, FS));
+    gl.attachShader(p, sh(gl.VERTEX_SHADER, makeVS(sd))); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, FS));
     gl.bindAttribLocation(p, 0, "a_pos"); gl.bindAttribLocation(p, 1, "a_band");
     gl.linkProgram(p);
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
-    this.prog = p; this.uMatrix = gl.getUniformLocation(p, "u_matrix"); this.uPal = gl.getUniformLocation(p, "u_pal");
+    const u = (n) => gl.getUniformLocation(p, n);
+    const prog = { p, pal: u("u_pal"), matrix: u("u_projection_matrix"), coords: u("u_projection_tile_mercator_coords"),
+                   clip: u("u_projection_clipping_plane"), transition: u("u_projection_transition"), fallback: u("u_projection_fallback_matrix") };
+    this.programs.set(sd.variantName, prog);
+    return prog;
+  },
+  onAdd(map, gl) {
+    this.map = map; this.gl = gl;
     const pal = new Uint8Array(256 * 4);
     for (let i = 0; i < 256; i++) { const c = bandRGB(BAND0 + i); pal.set(c ? [c[0], c[1], c[2], 255] : [0, 0, 0, 0], i * 4); }
     this.tex = gl.createTexture();
@@ -413,22 +428,27 @@ const live = {
       const seen = new Set(shown.map((d) => `${d.key}@${d.xw}`));
       draw = shown.concat(want.filter((t) => cache.has(t.key) && !seen.has(`${t.key}@${t.xw}`)).map((t) => ({ key: t.key, xw: t.xw })));
     }
-    const M = opts.defaultProjectionData.mainMatrix; // web mercator 0..1 -> clip, float64
-    gl.useProgram(this.prog);
+    const prog = this.program(opts.shaderData);
+    gl.useProgram(prog.p);
     gl.disable(gl.DEPTH_TEST); gl.disable(gl.STENCIL_TEST); gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex); gl.uniform1i(this.uPal, 0);
-    const now = performance.now(), m = new Float32Array(16);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex); gl.uniform1i(prog.pal, 0);
+    const now = performance.now(), n = (z) => 2 ** z;
     for (const { key, xw } of draw) {
       const t = cache.get(key);
       if (!t || !t.count) continue;
       t.used = now;
-      // matrix for tile-local 0..1 coordinates: M * translate(x/2^z, y/2^z) * scale(1/2^z)
-      const s = 1 / 2 ** t.z, tx = xw * s, ty = t.y * s; // xw places world copies
-      for (let i = 0; i < 4; i++) {
-        m[i] = M[i] * s; m[4 + i] = M[4 + i] * s; m[8 + i] = M[8 + i];
-        m[12 + i] = M[i] * tx + M[4 + i] * ty + M[12 + i];
-      }
-      gl.uniformMatrix4fv(this.uMatrix, false, m);
+      // exact per-tile projection (float32 tile matrix / globe uniforms) from MapLibre;
+      // wrap = which world copy this tile is drawn in
+      const wrap = Math.floor(xw / n(t.z));
+      const pd = map.transform.getProjectionData({
+        overscaledTileID: { canonical: { x: t.x, y: t.y, z: t.z }, wrap, overscaledZ: t.z, key: `live/${wrap}/${t.z}/${t.x}/${t.y}` },
+        applyGlobeMatrix: true,
+      });
+      gl.uniformMatrix4fv(prog.matrix, false, pd.mainMatrix);
+      gl.uniformMatrix4fv(prog.fallback, false, pd.fallbackMatrix);
+      gl.uniform4f(prog.coords, ...pd.tileMercatorCoords);
+      gl.uniform4f(prog.clip, ...pd.clippingPlane);
+      gl.uniform1f(prog.transition, pd.projectionTransition);
       gl.bindVertexArray(t.vao);
       gl.drawElements(gl.TRIANGLES, t.count, gl.UNSIGNED_INT, 0);
     }
@@ -511,7 +531,7 @@ const labelLayer = (id, minzoom, maxzoom, filter) => ({
 });
 const map = new maplibregl.Map({
   container: "map", antialias: true,
-  center: meta.view?.center ?? [-97.5, 38.6], zoom: (meta.view?.zoom ?? 3.9) - (window.innerWidth < 600 ? 1.3 : 0), minZoom: meta.global ? 1 : 2, maxZoom: 16,
+  center: meta.view?.center ?? [-97.5, 38.6], zoom: (meta.view?.zoom ?? 3.9) - (window.innerWidth < 600 ? 1.3 : 0), minZoom: meta.global ? 0 : 2, maxZoom: 16,
   renderWorldCopies: !!meta.global, attributionControl: false, dragRotate: false, pitchWithRotate: false,
   // Global models wrap endlessly east-west.  Regional models are held inside
   // their data by keepInsideData() below (the domain is curved in Mercator, so a
@@ -519,6 +539,8 @@ const map = new maplibregl.Map({
   maxBounds: undefined,
   style: {
     version: 8,
+    // global models: a globe when zoomed out, blending to Mercator as you zoom in (like Google Maps)
+    ...(meta.global ? { projection: { type: "globe" } } : {}),
     glyphs: "hrrrglyph://{fontstack}/{range}",
     sources: {
       t2m: { type: "vector", tiles: [`hrrr://${hour}/{z}/{x}/{y}`], minzoom: meta.tiles?.minzoom ?? 2, maxzoom: meta.tiles ? meta.tiles.maxzoom : 2 },
