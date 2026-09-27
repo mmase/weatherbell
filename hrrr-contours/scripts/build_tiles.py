@@ -536,6 +536,8 @@ def domain_tiles(fld, z):
     size = 2 * ORIGIN / 2**z
     x0, x1 = int((min(mx) + ORIGIN) // size), int((max(mx) + ORIGIN) // size)
     y0, y1 = int((ORIGIN - max(my)) // size), int((ORIGIN - min(my)) // size)
+    n = 2 ** z  # domains may reach past web mercator's +-85.05 deg / the date line
+    x0, x1, y0, y1 = max(0, x0), min(n - 1, x1), max(0, y0), min(n - 1, y1)
     return [(z, x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
 

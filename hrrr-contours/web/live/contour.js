@@ -27,6 +27,8 @@ export class Grid {
     this.latlon = proj.type === "latlon"; // x0/y0/dx in degrees, rows south -> north
     // nominal cell size in metres (sets the lattice density per zoom)
     this.cellM = this.latlon ? dx * 111320 * Math.cos(proj.lat0 * D2R) : dx;
+    // global grids wrap east-west: column nx-1 repeats column 0, one period = nx-1 columns
+    this.period = meta.global ? nx - 1 : 0;
     // Lambert conformal conic on a sphere (HRRR/NAM style); lat1 == lat2 is the tangent case.
     const R = proj.R, p1 = proj.lat1 * D2R, p2 = proj.lat2 * D2R, p0 = proj.lat0 * D2R;
     const n = Math.abs(p1 - p2) < 1e-10 ? Math.sin(p1)
@@ -67,7 +69,11 @@ export class Grid {
 
   // lon/lat (degrees) -> fractional grid index
   lonLatToIJ(lon, lat) {
-    if (this.latlon) return [(lon - this.x0) / this.dx, (lat - this.y0) / this.dx];
+    if (this.latlon) {
+      // any world copy (only wrap values outside the grid's own 360 degrees, so +180 stays at the east end)
+      if (this.period && (lon < this.x0 || lon > this.x0 + 360)) lon = ((lon - this.x0) % 360 + 360) % 360 + this.x0;
+      return [(lon - this.x0) / this.dx, (lat - this.y0) / this.dx];
+    }
     const { R, n, F, rho0, lon0 } = this.lcc;
     const rho = R * F / Math.pow(Math.tan(Math.PI / 4 + lat * D2R / 2), n);
     let dl = lon * D2R - lon0;
@@ -122,7 +128,10 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
   }
   const s = grid.step(z, spacingPx, allowCoarse);
   const pad = 2 * s + 0.1;
-  const ni0 = Math.max(0, Math.ceil((i0 - pad) / s)), ni1 = Math.min(Math.floor((nx - 1) / s), Math.floor((i1 + pad) / s));
+  const PER = grid.period; // global: columns wrap, so the window may run past either end
+  const ni0 = PER ? Math.ceil((i0 - pad) / s) : Math.max(0, Math.ceil((i0 - pad) / s));
+  const ni1 = PER ? Math.floor((i1 + pad) / s) : Math.min(Math.floor((nx - 1) / s), Math.floor((i1 + pad) / s));
+  const wrapCol = (c) => (PER ? ((c % PER) + PER) % PER : Math.min(nx - 1, Math.max(0, c)));
   const nj0 = Math.max(0, Math.ceil((j0 - pad) / s)), nj1 = Math.min(Math.floor((ny - 1) / s), Math.floor((j1 + pad) / s));
   const lw = ni1 - ni0 + 1, lh = nj1 - nj0 + 1;
   if (lw < 2 || lh < 2) return null;
@@ -134,9 +143,9 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
   const wa = B ? 1 - w : 1, wb = B ? w : 0;
   if (s >= 1) { // native grid values (s > 1: every s-th node, animation only)
     for (let r = 0; r < lh; r++) {
-      const row = (nj0 + r) * s * nx + ni0 * s;
+      const row = (nj0 + r) * s * nx;
       for (let c = 0; c < lw; c++) {
-        const g = row + c * s;
+        const g = row + wrapCol((ni0 + c) * s);
         val[r * lw + c] = (B ? A[g] * wa + B[g] * wb : A[g]) / scale;
       }
     }
@@ -153,7 +162,7 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
       for (let c = 0; c < lw; c++) {
         let acc = 0; const b = cb[c], k = c * 4;
         for (let t = 0; t < 4; t++) {
-          const ii = Math.min(nx - 1, Math.max(0, b - 1 + t)), gi = row + ii;
+          const gi = row + wrapCol(b - 1 + t);
           acc += cw[k + t] * (B ? A[gi] * wa + B[gi] * wb : A[gi]);
         }
         hr[o + c] = acc;
@@ -179,13 +188,15 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
   for (let r = 0; r < lh; r++) {
     const vj = (nj0 + r) * s, j = Math.min(ny - 2, Math.floor(vj)), fj = vj - j;
     for (let c = 0; c < lw; c++) {
-      const ui = (ni0 + c) * s, i = Math.min(nx - 2, Math.floor(ui)), fi = ui - i;
+      let ui = (ni0 + c) * s, shift = 0;
+      if (PER) { shift = Math.floor(ui / PER); ui -= shift * PER; } // world copy: +1 mercator width per period
+      const i = Math.min(nx - 2, Math.floor(ui)), fi = ui - i;
       const g00 = (j * nx + i) * 2, g10 = g00 + 2, g01 = g00 + nx * 2, g11 = g01 + 2;
       // bilinear between the four surrounding nodes (exact at nodes)
       const mx = (gp[g00] * (1 - fi) + gp[g10] * fi) * (1 - fj) + (gp[g01] * (1 - fi) + gp[g11] * fi) * fj;
       const my = (gp[g00 + 1] * (1 - fi) + gp[g10 + 1] * fi) * (1 - fj) + (gp[g01 + 1] * (1 - fi) + gp[g11 + 1] * fi) * fj;
       const p = r * lw + c;
-      px[p * 2] = (mx + ox) * tz; px[p * 2 + 1] = (my + oy) * tz;
+      px[p * 2] = (mx + ox + shift) * tz; px[p * 2 + 1] = (my + oy) * tz;
       bd[p] = Math.floor(val[p]);
     }
   }

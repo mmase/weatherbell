@@ -59,7 +59,8 @@ def main():
     a = ap.parse_args()
     run = dt.datetime.strptime(a.run, "%Y%m%d%H")
     # whole model domain by default; web mercator stops at +-85 deg
-    la0, la1, lo0, lo1 = (-85, 85, -180, 180) if a.region == "global" else (float(x) for x in a.region.split(","))
+    # one row beyond web mercator's +-85.05 deg so the data has no edge on screen
+    la0, la1, lo0, lo1 = (-85.25, 85.25, -180, 180) if a.region == "global" else (float(x) for x in a.region.split(","))
     out = os.path.join(a.out, "snow")
     grids = os.path.join(out, "grids")
     os.makedirs(grids, exist_ok=True)
@@ -108,11 +109,12 @@ def main():
           f"grids {t_grid:.1f}s, max {vmax:.1f} in, grid {len(cols)}x{len(rows)}", flush=True)
 
     label_bands = {THRESHOLDS.index(v) for v in LABELS}
-    meta["tiles"] = {"minzoom": 2, "maxzoom": a.tiles_maxzoom, "packs": {}}
+    minz = 1 if wrap else 2  # a world view needs zoom 1 (MapLibre won't draw below a source's minzoom)
+    meta["tiles"] = {"minzoom": minz, "maxzoom": a.tiles_maxzoom, "packs": {}}
     for fh in hours:
         _, packs, nbytes, secs = build_tiles.build(
             os.path.join(grids, f"f{fh:02d}.i16.gz"), os.path.join(out, "tiles", f"f{fh:02d}"),
-            2, a.tiles_maxzoom, log=False, pack=build_tiles.live_pack_key, label_levels=label_bands,
+            minz, a.tiles_maxzoom, log=False, pack=build_tiles.live_pack_key, label_levels=label_bands,
             min_band=0)  # under 0.1 in is transparent
         meta["tiles"]["packs"][f"{fh:02d}"] = sorted("%d-%d-%d" % k for k in packs)
         print(f"f{fh:02d}: z2-{a.tiles_maxzoom} tiles {secs:.1f}s, {sum(len(v) for v in packs.values())} tiles, "

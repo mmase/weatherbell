@@ -309,7 +309,7 @@ void main() { color = texelFetch(u_pal, ivec2(clamp(v_band - ${BAND0}, 0, 255), 
 
 const cache = new Map();    // tileKey -> {vao, bufs, count, bytes, used}
 const inflight = new Set();
-let shown = [];             // last complete set of tile keys
+let shown = [];             // last complete set of {key, xw} (xw: tile x incl. world copy)
 let displayed = null;       // frameKey of the last frame drawn complete
 let cachedBytes = 0;
 const GPU_BUDGET = (navigator.deviceMemory && navigator.deviceMemory <= 4 ? 160 : 384) * 1e6;
@@ -320,11 +320,14 @@ function visibleTiles(map, f) {
   const n = 2 ** z, b = map.getBounds();
   const tx = (lon) => Math.floor((lon + 180) / 360 * n);
   const ty = (lat) => Math.floor((1 - Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360)) / Math.PI) / 2 * n);
-  const x0 = Math.max(tx(Math.max(b.getWest(), DOMAIN.w)), 0), x1 = Math.min(tx(Math.min(b.getEast(), DOMAIN.e)), n - 1);
+  // global models wrap: x runs past the world (world copies); the data tile is x mod n
+  const x0 = meta.global ? tx(b.getWest()) : Math.max(tx(Math.max(b.getWest(), DOMAIN.w)), 0);
+  const x1 = meta.global ? tx(b.getEast()) : Math.min(tx(Math.min(b.getEast(), DOMAIN.e)), n - 1);
   const y0 = Math.max(ty(Math.min(b.getNorth(), DOMAIN.n)), 0), y1 = Math.min(ty(Math.max(b.getSouth(), DOMAIN.s)), n - 1);
   const c = map.getCenter(), cx = (c.lng + 180) / 360 * n, cy = (1 - Math.log(Math.tan(Math.PI / 4 + c.lat * Math.PI / 360)) / Math.PI) / 2 * n;
   const out = [];
-  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) out.push({ z, x, y, d: (x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 });
+  for (let xw = x0; xw <= x1; xw++) for (let y = y0; y <= y1; y++)
+    out.push({ z, x: ((xw % n) + n) % n, xw, y, d: (xw + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 });
   out.sort((a, b) => a.d - b.d);
   const fk = frameKey(f);
   return out.map((t) => ({ ...t, key: `${fk}|${t.z}/${t.x}/${t.y}` }));
@@ -402,21 +405,25 @@ const live = {
         map.triggerRepaint();
       });
     }
-    if (ready === want.length) { shown = want.map((t) => t.key); displayed = frameKey(f); }
+    if (ready === want.length) { shown = want.map((t) => ({ key: t.key, xw: t.xw })); displayed = frameKey(f); }
     // while playing, keep the previous complete frame until the next is complete;
     // otherwise draw what's ready on top of it (pans fill in tile by tile)
-    const draw = playing ? shown : [...new Set([...shown, ...want.filter((t) => cache.has(t.key)).map((t) => t.key)])];
+    let draw = shown;
+    if (!playing) {
+      const seen = new Set(shown.map((d) => `${d.key}@${d.xw}`));
+      draw = shown.concat(want.filter((t) => cache.has(t.key) && !seen.has(`${t.key}@${t.xw}`)).map((t) => ({ key: t.key, xw: t.xw })));
+    }
     const M = opts.defaultProjectionData.mainMatrix; // web mercator 0..1 -> clip, float64
     gl.useProgram(this.prog);
     gl.disable(gl.DEPTH_TEST); gl.disable(gl.STENCIL_TEST); gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex); gl.uniform1i(this.uPal, 0);
     const now = performance.now(), m = new Float32Array(16);
-    for (const key of draw) {
+    for (const { key, xw } of draw) {
       const t = cache.get(key);
       if (!t || !t.count) continue;
       t.used = now;
       // matrix for tile-local 0..1 coordinates: M * translate(x/2^z, y/2^z) * scale(1/2^z)
-      const s = 1 / 2 ** t.z, tx = t.x * s, ty = t.y * s;
+      const s = 1 / 2 ** t.z, tx = xw * s, ty = t.y * s; // xw places world copies
       for (let i = 0; i < 4; i++) {
         m[i] = M[i] * s; m[4 + i] = M[4 + i] * s; m[8 + i] = M[8 + i];
         m[12 + i] = M[i] * tx + M[4 + i] * ty + M[12 + i];
@@ -426,7 +433,7 @@ const live = {
       gl.drawElements(gl.TRIANGLES, t.count, gl.UNSIGNED_INT, 0);
     }
     gl.bindVertexArray(null);
-    const keep = new Set([...draw, ...want.map((t) => t.key)]);
+    const keep = new Set([...draw.map((d) => d.key), ...want.map((t) => t.key)]);
     if (playing) this.drop((k) => !keep.has(k)); // frames already played are never reused
     this.evict(keep);
     if (!playing && ready < want.length) map.triggerRepaint();
@@ -505,15 +512,16 @@ const labelLayer = (id, minzoom, maxzoom, filter) => ({
 const map = new maplibregl.Map({
   container: "map", antialias: true,
   center: meta.view?.center ?? [-97.5, 38.6], zoom: (meta.view?.zoom ?? 3.9) - (window.innerWidth < 600 ? 1.3 : 0), minZoom: meta.global ? 1 : 2, maxZoom: 16,
-  renderWorldCopies: false, attributionControl: false, dragRotate: false, pitchWithRotate: false,
-  // pan limits follow the model: the whole world for global models, else the domain plus a margin
-  // (none for global models: MapLibre fails on world-wide bounds, and the world doesn't repeat anyway)
-  maxBounds: meta.global ? undefined : [[DOMAIN.w - 25, Math.max(-85, DOMAIN.s - 15)], [DOMAIN.e + 25, Math.min(85, DOMAIN.n + 15)]],
+  renderWorldCopies: !!meta.global, attributionControl: false, dragRotate: false, pitchWithRotate: false,
+  // Global models wrap endlessly east-west.  Regional models are held inside
+  // their data by keepInsideData() below (the domain is curved in Mercator, so a
+  // rectangular maxBounds would either cut off data or show its edge).
+  maxBounds: undefined,
   style: {
     version: 8,
     glyphs: "hrrrglyph://{fontstack}/{range}",
     sources: {
-      t2m: { type: "vector", tiles: [`hrrr://${hour}/{z}/{x}/{y}`], minzoom: 2, maxzoom: meta.tiles ? meta.tiles.maxzoom : 2 },
+      t2m: { type: "vector", tiles: [`hrrr://${hour}/{z}/{x}/{y}`], minzoom: meta.tiles?.minzoom ?? 2, maxzoom: meta.tiles ? meta.tiles.maxzoom : 2 },
       geo: { type: "geojson", data: new URL("../boundaries.json", location.href).href, tolerance: 0.25 },
     },
     layers: [
@@ -542,6 +550,45 @@ const map = new maplibregl.Map({
   },
 });
 map.on("load", () => map.addLayer(live, "coast"));
+
+// ---- regional models: the view may never leave the data (no visible data edge)
+function viewInsideData() {
+  const c = map.getCanvas(), W = c.clientWidth, H = c.clientHeight, N = 12;
+  for (let k = 0; k <= N; k++) {
+    for (const [x, y] of [[W * k / N, 0], [W * k / N, H], [0, H * k / N], [W, H * k / N]]) {
+      const ll = map.unproject([x, y]);
+      const [i, j] = grid.lonLatToIJ(ll.lng, ll.lat);
+      if (!(i >= 0.5 && j >= 0.5 && i <= NX - 1.5 && j <= NY - 1.5)) return false;
+    }
+  }
+  return true;
+}
+if (!meta.global) {
+  let good = null, fixing = false;
+  const state = () => ({ center: map.getCenter(), zoom: map.getZoom() });
+  const lerp = (a, b, t) => ({ center: [a.center.lng + (b.center.lng - a.center.lng) * t, a.center.lat + (b.center.lat - a.center.lat) * t],
+                               zoom: a.zoom + (b.zoom - a.zoom) * t });
+  // start inside: zoom in from the initial view until it fits
+  for (let k = 0; k < 60 && !viewInsideData(); k++) map.jumpTo({ zoom: map.getZoom() + 0.1 });
+  good = state();
+  map.on("move", () => {
+    if (fixing) return;
+    if (viewInsideData()) { good = state(); return; }
+    // went past the data: step back to the furthest valid point along this move
+    fixing = true;
+    const target = state();
+    let lo = 0, hi = 1;
+    for (let k = 0; k < 10; k++) {
+      const mid = (lo + hi) / 2;
+      map.jumpTo(lerp(good, target, mid));
+      if (viewInsideData()) lo = mid; else hi = mid;
+    }
+    map.jumpTo(lerp(good, target, lo));
+    good = state();
+    fixing = false;
+  });
+  map.on("resize", () => { for (let k = 0; k < 60 && !viewInsideData(); k++) map.jumpTo({ zoom: map.getZoom() + 0.1 }); good = state(); });
+}
 window.map = map;
 window.__live = { get frame() { return frame; }, cache, inflight, get shown() { return shown; }, stats, missing: 0, frames: 0 };
 const perfEl = document.getElementById("perf");
