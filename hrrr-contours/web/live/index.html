@@ -223,7 +223,7 @@ const bandRGB = (b) => {
   return hex(VAR.colors[Math.min(b, VAR.colors.length - 1)]);
 };
 const fmtV = (v, extra = 0) => v.toFixed(DEC + extra);
-const UNIT = VAR.units, isTemp = VAR.id === "t2m";
+const UNIT = VAR.units, isTemp = UNIT === "°F";
 const rgbStr = (c) => (c ? `rgb(${c[0]},${c[1]},${c[2]})` : "rgba(0,0,0,0)");
 // band units <-> display units
 function toValue(u) {

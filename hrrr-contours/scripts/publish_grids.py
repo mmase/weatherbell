@@ -37,15 +37,40 @@ from pyproj import Transformer
 
 BUCKET = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
 # Each field: GRIB index match, unit conversion, band interval (display units),
+# Temperature colour scale (°F), one colour per 1° band from -100 to 129
+# (WeatherBell-style; sampled from the reference colour bar, centre of each degree).
+TEMP_COLORS = """
+    #410c6b #4d0984 #4c0a85 #4c0a85 #4c0a85 #4b0a86 #531883 #541881 #771a85 #821782 #801881
+    #811880 #801881 #82177f #941d83 #981f82 #9a2080 #a32483 #a4247f #b4277c #c62c7e #c62a7c
+    #c7297c #c82a7d #d9317f #da307d #df337f #e0347f #e23a87 #e13c8b #e03f8b #e95da2 #e45fa2
+    #e55ea3 #e55ea2 #e65fa3 #e560a3 #de7aa4 #dc7ca4 #e494c3 #e296c4 #e396c4 #e395c5 #e495c5
+    #e296c5 #d8a5ce #d4aacc #d3a9cc #d3a9cd #d3a9ce #d3a9cf #cabbd6 #c8bdd6 #c7bdd6 #c7bdd7
+    #c6bed6 #bdcad9 #bccbd8 #baccd8 #bbe1e8 #bae1e9 #bbe2e8 #b9e1ea #afdbe7 #aadde8 #aef3f5
+    #aff1f2 #adf2f4 #aef3f4 #aef2f4 #9fd9df #a1d7df #8fc2cd #89b5c7 #73acb0 #72abae #5d8b99
+    #5f8796 #5d7580 #48696d #456a6b #2d5851 #2e5952 #2f5652 #22353e #2e5a54 #2e5a55 #456b6d
+    #456b6d #476b6f #5d7982 #637b86 #778c94 #8f9696 #92a6a9 #96a8aa #b5b8ba #b5b8b9 #c4c3c2
+    #cfcfdb #39248b #3a238d #3b238c #4f1a84 #521981 #561c74 #612650 #612654 #632555 #672551
+    #783047 #793042 #7e322c #853328 #953c26 #9f5538 #b25c48 #b25c4a #b0604b #af7759 #c68e90
+    #c6908e #c79393 #d3a0a0 #dcaeae #e1b9b8 #e7c5c3 #eed0cf #f5dbdc #f9e6e6 #f1e7e6 #ece8e7
+    #e6e7e9 #e1eaeb #d9ebec #cfebee #c9eded #bbe5ea #a7d5e7 #97c7e2 #85b8de #75a5d4 #6f9ac9
+    #6990bd #6483b5 #5f75aa #5969a0 #515c92 #4e548b #565790 #6969a3 #7675b1 #8584b5 #9998b0
+    #a6a5ac #b6b5a5 #c4c3a3 #d2d19e #e1e197 #f3f691 #fcfb87 #fcef79 #fbe671 #f6db66 #f6d05c
+    #f0be4c #ecb442 #eba93c #eda038 #ee9736 #ee9034 #ea8731 #ea7e2f #e7762c #e4702c #e5682d
+    #e4622b #dd5e28 #d05224 #c54822 #af361a #a12c16 #912111 #79160c #6e1611 #681914 #631e17
+    #62201b #5e321a #58412e #564042 #594d43 #605b46 #675f4e #7e7267 #97786e #99796e #9e877f
+    #a1958e #9e9089 #9d8c85 #997c75 #9b786f #9a7870 #9b7870 #9b786f #97675e #975d51 #8d5552
+    #844d4f #834e4f #783747 #782f49 #782f48 #772f4b #682850 #593547 #554140 #544141 #494742
+    #434a43 #434944 #424a43 #3a4f4a #2d5b51 #39774f #377a4e #38794d #38794a #38794b
+""".split()
+assert len(TEMP_COLORS) == 230
+
 # int16 counts per band, and the colour ramp (display units -> colour).
 VARIABLES = {
     "t2m": {
         "match": ":TMP:2 m above ground:", "name": "2 m Air Temperature", "short": "Temperature",
         "units": "°F", "interval": 1, "decimals": 0, "scale": 10,
         "convert": lambda k: (k - 273.15) * 9 / 5 + 32,
-        "stops": [[-40, "#f1e6f5"], [-20, "#c7a4d8"], [0, "#7b4fa6"], [10, "#4b3f9e"], [20, "#2c5aa8"],
-                  [32, "#3d93d1"], [40, "#72c6cf"], [50, "#58b37a"], [60, "#9ccb52"], [70, "#eadb55"],
-                  [80, "#f5a940"], [90, "#e66a31"], [100, "#c42a2c"], [110, "#8e1239"], [120, "#e6a3c3"]],
+        "stops": [[t + 0.5, c] for t, c in zip(range(-100, 130), TEMP_COLORS)],  # one colour per degree
         "ticks": 10, "highlight": 32,
     },
     "pwat": {
