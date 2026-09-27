@@ -27,6 +27,8 @@ export class Grid {
     this.latlon = proj.type === "latlon"; // x0/y0/dx in degrees, rows south -> north
     // nominal cell size in metres (sets the lattice density per zoom)
     this.cellM = this.latlon ? dx * 111320 * Math.cos(proj.lat0 * D2R) : dx;
+    // pyramid level: this grid holds every k-th node of the published grid
+    this.k = meta.levelK || 1;
     // global grids wrap east-west: column nx-1 repeats column 0, one period = nx-1 columns
     this.period = meta.global ? nx - 1 : 0;
     // Lambert conformal conic on a sphere (HRRR/NAM style); lat1 == lat2 is the tangent case.
@@ -38,10 +40,15 @@ export class Grid {
     if (opts.positions === false) return;
     // web-mercator position of every grid node, stored as float32 offsets from
     // the first node (relative precision stays ~1e-8 of the world at any zoom)
-    const pos = new Float32Array(nx * ny * 2);
-    let o = 0;
     const [ox, oy] = this.nodeMerc(0, 0);
     this.ox = ox; this.oy = oy;
+    if (this.latlon) { // separable: x depends only on the column, y only on the row
+      this.px = Float32Array.from({ length: nx }, (_, i) => this.nodeMerc(i, 0)[0] - ox);
+      this.py = Float32Array.from({ length: ny }, (_, j) => this.nodeMerc(0, j)[1] - oy);
+      return;
+    }
+    const pos = new Float32Array(nx * ny * 2);
+    let o = 0;
     for (let j = 0; j < ny; j++) {
       for (let i = 0; i < nx; i++) {
         const [mx, my] = this.nodeMerc(i, j);
@@ -86,8 +93,9 @@ export class Grid {
   // domain's reference latitude, rounded to a power of two, at most 1 cell
   step(z, spacingPx, allowCoarse = false) {
     const mPerPx = WORLD * Math.cos(this.meta.proj.lat0 * D2R) / (512 * 2 ** z);
-    const s = 2 ** Math.round(Math.log2(spacingPx * mPerPx / this.cellM));
-    return Math.min(allowCoarse ? 8 : 1, s);
+    // in nodes of the full-resolution grid, then in this level's nodes
+    const s = 2 ** Math.round(Math.log2(spacingPx * mPerPx / (this.cellM / this.k)));
+    return Math.min(allowCoarse ? 8 : 1, s) / this.k;
   }
 }
 
@@ -127,7 +135,7 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
     }
   }
   const s = grid.step(z, spacingPx, allowCoarse);
-  const pad = 2 * s + 0.1;
+  const pad = 2 * s + 0.1 / grid.k; // in this level's nodes; the same window at every pyramid level
   const PER = grid.period; // global: columns wrap, so the window may run past either end
   const ni0 = PER ? Math.ceil((i0 - pad) / s) : Math.max(0, Math.ceil((i0 - pad) / s));
   const ni1 = PER ? Math.floor((i1 + pad) / s) : Math.min(Math.floor((nx - 1) / s), Math.floor((i1 + pad) / s));
@@ -184,17 +192,21 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
   // ---- lattice positions (tile-local 0..1) and bands
   const P = new Buf(Float32Array, np * 2 + 4096), Bd = new Buf(Int16Array, np + 2048);
   const px = P.a, bd = Bd.a;
-  const gp = grid.pos, ox = grid.ox - tx0, oy = grid.oy - ty0;
+  const gp = grid.pos, gx = grid.px, gy = grid.py, ox = grid.ox - tx0, oy = grid.oy - ty0;
   for (let r = 0; r < lh; r++) {
     const vj = (nj0 + r) * s, j = Math.min(ny - 2, Math.floor(vj)), fj = vj - j;
     for (let c = 0; c < lw; c++) {
       let ui = (ni0 + c) * s, shift = 0;
       if (PER) { shift = Math.floor(ui / PER); ui -= shift * PER; } // world copy: +1 mercator width per period
       const i = Math.min(nx - 2, Math.floor(ui)), fi = ui - i;
-      const g00 = (j * nx + i) * 2, g10 = g00 + 2, g01 = g00 + nx * 2, g11 = g01 + 2;
-      // bilinear between the four surrounding nodes (exact at nodes)
-      const mx = (gp[g00] * (1 - fi) + gp[g10] * fi) * (1 - fj) + (gp[g01] * (1 - fi) + gp[g11] * fi) * fj;
-      const my = (gp[g00 + 1] * (1 - fi) + gp[g10 + 1] * fi) * (1 - fj) + (gp[g01 + 1] * (1 - fi) + gp[g11 + 1] * fi) * fj;
+      let mx, my;
+      if (gx) { // lat/lon: separable, linear along each axis (exact at nodes)
+        mx = gx[i] * (1 - fi) + gx[i + 1] * fi; my = gy[j] * (1 - fj) + gy[j + 1] * fj;
+      } else { // bilinear between the four surrounding nodes (exact at nodes)
+        const g00 = (j * nx + i) * 2, g10 = g00 + 2, g01 = g00 + nx * 2, g11 = g01 + 2;
+        mx = (gp[g00] * (1 - fi) + gp[g10] * fi) * (1 - fj) + (gp[g01] * (1 - fi) + gp[g11] * fi) * fj;
+        my = (gp[g00 + 1] * (1 - fi) + gp[g10 + 1] * fi) * (1 - fj) + (gp[g01 + 1] * (1 - fi) + gp[g11 + 1] * fi) * fj;
+      }
       const p = r * lw + c;
       px[p * 2] = (mx + ox + shift) * tz; px[p * 2 + 1] = (my + oy) * tz;
       bd[p] = Math.floor(val[p]);
@@ -353,4 +365,12 @@ export function sample(grid, fields, w, lon, lat) {
     }
   }
   return acc / grid.meta.scale;
+}
+
+// Pyramid level k of a published grid: every k-th node (published as fHH-k.i16.gz
+// for the k in meta.levels).  Contouring with a lattice step of s >= k nodes
+// reads only these nodes, so the result is identical to using the full grid.
+export function levelMeta(meta, k) {
+  if (k === 1) return meta;
+  return { ...meta, levelK: k, nx: (meta.nx - 1) / k + 1, ny: (meta.ny - 1) / k + 1, dx: meta.dx * k };
 }

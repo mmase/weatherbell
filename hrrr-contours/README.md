@@ -138,7 +138,8 @@ Measured in this repo's container (Node / headless Chromium, 4 vCPU):
 closes at the date line:
 
 ```
-python3 scripts/publish_gfs_t2m.py --run 2026092706 --hours 72 --step 6   # 2 m temperature
+python3 scripts/publish_gfs_t2m.py --run 2026092706 --hours 72 --step 6   # 2 m temperature, 0.25°
+python3 scripts/publish_gfs_t2m.py --grid t1534 --run 2026092706          # native T1534 grid (13 km)
 python3 scripts/publish_gfs_snow.py --run 2026022200 --hours 72            # 10:1 snowfall
 ```
 
@@ -151,6 +152,42 @@ Sagittarius), drawn in a 2D canvas under the transparent map canvas and redrawn 
 when the view moves. MapLibre's atmosphere adds the blue limb. The polar caps above the
 data (85.25° to 90°) are filled by the WebGL layer with the nearest data row, smoothed
 progressively toward the pole, using MapLibre's pole vertices (y = −32768 / 40960).
+
+**GFS T1534 (native 13 km).** NOAA still publishes GFS on the model's own T1534
+Gaussian grid (`sfluxgrbfFFF.grib2`, 3072 × 1536, 0.117°), 4.6× the points of the 0.25°
+product. Gaussian latitudes are within 1% of evenly spaced, so rows are resampled
+(cubic) onto an even 0.1171875° grid and nothing downstream changes. What it costs:
+
+| per forecast hour | 0.25° | T1534 |
+|---|---|---|
+| grid points (cropped to ±85°) | 1.0 M | 4.5 M |
+| full grid, gzipped | 0.6 MB | 2.4 MB |
+| every 8th node (pyramid level) | – | 69 KB |
+| server: grid + pyramid / z0–z2 tiles | 0.4 s / 3 s | 1.8 s / 12 s |
+| device, one z3 tile static / playback | 80 / 25 ms | 69 / 8 ms |
+| device, one z7 tile | 12 ms, 2.2 MB GPU | 4 ms, 0.9 MB GPU |
+
+Device contouring is not the bottleneck: the lattice spacing is set in screen pixels,
+so a finer grid only replaces the bicubic upsampling the 0.25° grid needed. The costs
+that grow with resolution are download and memory, handled by:
+
+* **A grid pyramid.** Each hour is also published at every 2nd, 4th and 8th node
+  (`fHH-k.i16.gz`, `meta.levels`). When the lattice step is s nodes (zoomed out, and
+  all playback), the device fetches the coarsest level k ≤ s. The lattice reads only
+  those nodes, so the contours are identical (checked tile by tile), from 1/4–1/64
+  of the data. A globe animation streams 69 KB per hour instead of 2.4 MB.
+* **Byte budgets instead of "keep everything".** The page keeps decoded hours in an
+  LRU capped at 160 MB (64 MB on ≤4 GB devices), each worker at 48 MB, and playback
+  prefetches only the next four hours, so a 300-frame run streams through.
+* **Separable node positions.** For lat/lon grids a node's Mercator x depends only on
+  its column and y only on its row: two arrays (18 KB) instead of a table per node
+  (36 MB per worker at T1534).
+* The value readout uses the full grid when paused and the displayed level while
+  playing.
+
+Still to do for very large runs: split the full-resolution grid into regional chunks
+so zoomed-in playback downloads only the visible area (today it streams whole 2.4 MB
+hours at z5+), and move contouring to WebAssembly or the GPU.
 
 Not done yet: contour labels above z6, real-device GPU frame-rate measurements (the
 container only has a software rasteriser), and tuning for low-memory phones.

@@ -174,7 +174,7 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
 
 <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.9.0/dist/maplibre-gl.js"></script>
 <script type="module">
-import { Grid, sample } from "./contour.js";
+import { Grid, sample, levelMeta } from "./contour.js";
 
 // ------------------------------------------------------------------ colours
 // One palette shared by the tile layers and the WebGL layer (CIELAB blend).
@@ -249,21 +249,46 @@ async function fetchBin(path) {
 const inflate = async (buf) => new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
 const HOURS = meta.hours, NX = meta.nx, NY = meta.ny;
 const hh = (h) => String(h).padStart(2, "0");
-const fieldCache = new Map(); // hour -> Promise<Int16Array> (decoded: degF * scale)
-const fieldReady = new Map(); // hour -> Int16Array, once loaded
+// Decoded hours, keyed "hour@k" (k = pyramid level: every k-th node; 1 = full grid),
+// least recently used first and trimmed to a byte budget (a 300-frame run must not
+// accumulate).  Zoomed out and in playback the lattice samples every k-th node,
+// so only that level is downloaded: 1/64 of the data at k = 8.
+const LEVELS = [1, ...(meta.levels || [])];
+const fieldCache = new Map(); // "h@k" -> Promise<Int16Array>
+const fieldReady = new Map(); // "h@k" -> Int16Array, once loaded
+const MAIN_BUDGET = (navigator.deviceMemory && navigator.deviceMemory <= 4 ? 64 : 160) * 1e6;
+let readyBytes = 0;
 const POLAR_CAPS = !!meta.global && meta.proj.type === "latlon";
-function field(h) {
-  if (!fieldCache.has(h)) {
-    fieldCache.set(h, fetchBin(`${BASE}grids/f${hh(h)}.i16.gz`).then(inflate).then((buf) => {
-      const d = new Int16Array(buf);
-      for (let r = 0; r < NY; r++) for (let c = 1, o = r * NX; c < NX; c++) d[o + c] += d[o + c - 1]; // undo row deltas
-      fieldReady.set(h, d);
-      return d;
-    }));
+const levelDims = (k) => [(NX - 1) / k + 1, (NY - 1) / k + 1];
+function field(h, k = 1) {
+  const key = `${h}@${k}`;
+  if (fieldCache.has(key)) { const p = fieldCache.get(key); fieldCache.delete(key); fieldCache.set(key, p); return p; }
+  const [nx, ny] = levelDims(k);
+  const p = fetchBin(`${BASE}grids/f${hh(h)}${k > 1 ? "-" + k : ""}.i16.gz`).then(inflate).then((buf) => {
+    const d = new Int16Array(buf);
+    for (let r = 0; r < ny; r++) for (let c = 1, o = r * nx; c < nx; c++) d[o + c] += d[o + c - 1]; // undo row deltas
+    if (fieldCache.get(key) === p) { fieldReady.set(key, d); readyBytes += d.byteLength; trimFields(); }
+    return d;
+  });
+  fieldCache.set(key, p);
+  return p;
+}
+function trimFields() {
+  for (const key of fieldCache.keys()) {
+    if (readyBytes <= MAIN_BUDGET) break;
+    const d = fieldReady.get(key), h = +key.split("@")[0];
+    if (!d || h === frame.hA || h === frame.hB) continue; // pending, or on screen
+    fieldCache.delete(key); fieldReady.delete(key); readyBytes -= d.byteLength;
   }
-  return fieldCache.get(h);
 }
 const grid = new Grid(meta, { positions: false }); // projection only, for the readout
+const levelGrids = new Map([[1, grid]]);
+const levelGrid = (k) => { if (!levelGrids.has(k)) levelGrids.set(k, new Grid(levelMeta(meta, k), { positions: false })); return levelGrids.get(k); };
+// coarsest pyramid level that the lattice at this zoom reads exactly
+function levelFor(z, px, coarse) {
+  const s = grid.step(Math.max(0, Math.round(z)), px, coarse);
+  return LEVELS.reduce((k, L) => (L <= s && L > k ? L : k), 1);
+}
 
 // ------------------------------------------------------------------ workers
 const NW = Math.max(1, Math.min(6, (navigator.hardwareConcurrency || 4) - 1));
@@ -272,7 +297,7 @@ const jobs = new Map(); // id -> {resolve}
 let nextId = 1;
 for (let i = 0; i < NW; i++) {
   const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
-  const entry = { w, inflight: 0, hours: [] };
+  const entry = { w, inflight: 0, has: new Set() }; // "h@k" sent to this worker
   w.onmessage = (e) => {
     const m = e.data;
     if (m.type !== "tile") return;
@@ -284,17 +309,21 @@ for (let i = 0; i < NW; i++) {
   pool.push(entry);
 }
 async function contour(job) {
+  const k = levelFor(job.z, job.spacing, job.allowCoarse);
   const need = [job.hA, job.hB].filter((h) => h != null);
-  const data = await Promise.all(need.map(field));
+  const data = await Promise.all(need.map((h) => field(h, k)));
   const e = pool.reduce((a, b) => (b.inflight < a.inflight ? b : a));
-  need.forEach((h, i) => {
-    if (e.hours.includes(h)) return;
-    e.w.postMessage({ type: "field", hour: h, buf: data[i].buffer.slice(0) });
-    e.hours.push(h); if (e.hours.length > 6) e.hours.shift(); // mirrors the worker's LRU
+  const keys = need.map((h) => `${h}@${k}`);
+  keys.forEach((key, i) => {
+    if (e.has.has(key)) return;
+    e.w.postMessage({ type: "field", hour: need[i], k, buf: data[i].buffer.slice(0) });
+    e.has.add(key);
   });
   e.inflight++;
   const id = nextId++;
-  return new Promise((resolve) => { jobs.set(id, { resolve }); e.w.postMessage({ type: "tile", id, ...job }); });
+  const m = await new Promise((resolve) => { jobs.set(id, { resolve }); e.w.postMessage({ type: "tile", id, k, ...job }); });
+  if (m.missing) keys.forEach((key) => e.has.delete(key)); // the worker evicted it: resend next time
+  return m;
 }
 
 // ------------------------------------------------------------------ state
@@ -436,16 +465,17 @@ const live = {
   drawCaps(gl, opts) {
     if (!POLAR_CAPS || this.map.getZoom() > 7) return;
     const f = playing ? frame : { ...frame, hB: null, w: 0 };
-    const A = fieldReady.get(f.hA), B = f.hB == null ? null : fieldReady.get(f.hB);
-    if (!A || (f.hB != null && !B)) { field(f.hA).then(() => this.map.triggerRepaint()); if (f.hB != null) field(f.hB).then(() => this.map.triggerRepaint()); return; }
+    const k = levelFor(this.map.getZoom(), 2, true), [NXk, NYk] = levelDims(k);
+    const A = fieldReady.get(`${f.hA}@${k}`), B = f.hB == null ? null : fieldReady.get(`${f.hB}@${k}`);
+    if (!A || (f.hB != null && !B)) { field(f.hA, k).then(() => this.map.triggerRepaint()); if (f.hB != null) field(f.hB, k).then(() => this.map.triggerRepaint()); return; }
     // with device tiles drawn on top, the cap may run under them (a coarse
     // playback lattice can stop short of the last row); under MapLibre's own
     // tile layers it must stop exactly at their edge (85.05°)
     const under = this.active();
-    const key = `${f.hA}|${f.hB}|${f.w.toFixed(3)}|${under}`;
+    const key = `${f.hA}|${f.hB}|${f.w.toFixed(3)}|${under}|${k}`;
     if (this.capKey !== key) {
-      const N = NX - 1, row = (r) => { const o = new Float64Array(N);
-        for (let k = 0; k < N; k++) { const c = r * NX + k; o[k] = (B ? A[c] * (1 - f.w) + B[c] * f.w : A[c]) / meta.scale; } return o; };
+      const N = NXk - 1, row = (r) => { const o = new Float64Array(N);
+        for (let i = 0; i < N; i++) { const c = r * NXk + i; o[i] = (B ? A[c] * (1 - f.w) + B[c] * f.w : A[c]) / meta.scale; } return o; };
       const smooth = (v, h) => { // circular moving mean over 2h+1 columns (h = Infinity: row mean)
         if (!h) return v;
         const mean = v.reduce((a, b) => a + b, 0) / N;
@@ -462,13 +492,13 @@ const live = {
       const segs = N * 2 * RINGS.length;
       const pos = new Float32Array(segs * 8), band = new Int16Array(segs * 4), index = new Uint32Array(segs * 6);
       let v = 0, q = 0;
-      for (const [r, sgn] of [[NY - 1, 1], [0, -1]]) {
+      for (const [r, sgn] of [[NYk - 1, 1], [0, -1]]) {
         const base = row(r);
         for (const [la0, la1, h] of RINGS) {
           const vals = smooth(base, h);
           const y0 = mercY(sgn * la0), y1 = la1 === 90 ? (sgn > 0 ? -32768 : 40960) : mercY(sgn * la1);
-          for (let k = 0; k < N; k++) {
-            const b = Math.floor(vals[k] + 1e-4), xa = (meta.x0 + meta.dx * (k - 0.5) + 180) / 360 * 8192, xb = xa + meta.dx / 360 * 8192;
+          for (let i = 0; i < N; i++) {
+            const dxk = meta.dx * k, b = Math.floor(vals[i] + 1e-4), xa = (meta.x0 + dxk * (i - 0.5) + 180) / 360 * 8192, xb = xa + dxk / 360 * 8192;
             pos.set([xa, y1, xb, y1, xa, y0, xb, y0], v * 2);
             band.fill(b, v, v + 4);
             index.set([v, v + 1, v + 3, v, v + 2, v + 3], q); // provoking vertex (last) carries the band
@@ -827,7 +857,7 @@ function setHour(h) {
   frame = { hA: h, hB: null, w: 0, px: STATIC_PX, coarse: false };
   map.getSource("t2m").setTiles([`hrrr://${h}/{z}/{x}/{y}`]);
   map.triggerRepaint();
-  field(h).then(() => lastPt && readout(lastPt.point, lastPt.lngLat));
+  if (lastPt) readout(lastPt.point, lastPt.lngLat); // loads the full grid, for the readout only
 }
 slider.addEventListener("input", () => setHour(HOURS[+slider.value]));
 let lastTick = 0;
@@ -844,18 +874,25 @@ function tick(now) {
     let i = Math.floor(playT), w = Math.round((playT - i) * 16) / 16;
     if (w >= 1) { i += 1; w = 0; }
     const hA = HOURS[i], hB = HOURS[i + 1];
+    if (hA !== frame.hA) prefetch(i);
     frame = w === 0 || hB == null ? { hA, hB: null, w: 0, px: PLAY_PX, coarse: true } : { hA, hB, w, px: PLAY_PX, coarse: true };
     slider.value = i; showValid(hB == null ? hA : hA + w * (hB - hA));
     map.triggerRepaint();
   }
   requestAnimationFrame(tick);
 }
+// playback look-ahead: the next few hours, at the pyramid level playback reads
+// (bounded, so a long run streams instead of piling up in memory)
+function prefetch(i) {
+  const k = levelFor(map.getZoom(), PLAY_PX, true);
+  for (const h of HOURS.slice(i, i + 4)) field(h, k);
+}
 playBtn.addEventListener("click", () => {
   playing = !playing;
   playBtn.textContent = playing ? "❚❚" : "▶";
   playBtn.setAttribute("aria-label", playing ? "Pause forecast" : "Play forecast");
   if (playing) {
-    HOURS.forEach(field); // prefetch every hour
+    prefetch(HOURS.indexOf(hour));
     playT = HOURS.indexOf(hour); lastTick = 0; setTileLayers(false);
     requestAnimationFrame(tick);
   } else {
@@ -906,8 +943,10 @@ const val = document.getElementById("val"), sub = document.getElementById("sub")
 let lastPt = null, pendingRO = null;
 async function readout(point, lngLat) {
   lastPt = { point, lngLat };
-  const f = frame, A = await field(f.hA), B = f.hB == null ? null : await field(f.hB);
-  const t = sample(grid, B ? [A, B] : [A], f.w, lngLat.lng, lngLat.lat);
+  // while playing, read the level on screen (the full grid per frame would defeat the pyramid)
+  const f = frame, k = playing ? levelFor(map.getZoom(), PLAY_PX, true) : 1;
+  const A = await field(f.hA, k), B = f.hB == null ? null : await field(f.hB, k);
+  const t = sample(levelGrid(k), B ? [A, B] : [A], f.w, lngLat.lng, lngLat.lat);
   if (t == null) { val.innerHTML = "––"; sub.innerHTML = `Outside the<br>${meta.model} domain`; cur.style.display = "none"; return; }
   const v = toValue(t), b = Math.floor(t);
   const alt = isTemp ? `${((v - 32) * 5 / 9).toFixed(1)} °C` : VAR.alt ? `${(v * VAR.alt.factor).toFixed(1)} ${VAR.alt.units}` : `${(v * 25.4).toFixed(1)} mm`;
@@ -930,7 +969,7 @@ for (const [id, layers] of Object.entries(toggles)) {
   b.onclick = () => { const on = b.getAttribute("aria-pressed") !== "true"; b.setAttribute("aria-pressed", on);
     layers.forEach((l) => map.setLayoutProperty(l, "visibility", on ? "visible" : "none")); };
 }
-field(hour);
+field(hour, levelFor(map.getZoom(), 2, true)); // warm the level the first view needs
 </script>
 </body>
 </html>
