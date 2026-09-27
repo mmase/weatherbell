@@ -26,10 +26,17 @@ Pipeline (per tile, per zoom):
 Tiles are gzipped and grouped into a small number of "pack" files so the result
 can be served from any static host (no range requests, few files).
 """
+import os
+
+# One BLAS/OpenMP thread per worker: parallelism comes from the process pool,
+# and letting each worker also spawn a thread per core oversubscribes the CPU
+# (measured: 5.5 min -> 2.3 min on 4 cores).  Must be set before numpy loads.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import gzip
 import json
 import math
-import os
 import struct
 import sys
 import time
@@ -507,3 +514,7 @@ def main(grib="data/hrrr_t2m.grib2", out="web/tiles"):
 
 if __name__ == "__main__":
     main(*sys.argv[1:])
+    # eccodes and PROJ both register native teardown that can double-free at
+    # interpreter exit; all output is written, so skip teardown.
+    sys.stdout.flush()
+    os._exit(0)

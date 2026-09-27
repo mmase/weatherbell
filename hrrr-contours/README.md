@@ -5,7 +5,7 @@ A self-contained pipeline and web map that takes the latest NOAA HRRR analysis
 MapLibre slippy map, with one contour per 1 °F.
 
 ```
-./build.sh                         # fetch latest run, build tiles/glyphs/boundaries (~7 min on 4 cores)
+./build.sh                         # fetch latest run, build tiles/glyphs/boundaries (~2.5 min on 4 cores)
 npx http-server web -p 8080        # any static server works
 ```
 
@@ -38,13 +38,20 @@ Nothing is simplified or dropped from the fill geometry at any zoom.
 ### No gaps: stacked superlevel sets
 
 Each tile stores, for every integer t, the polygon **{T ≥ t}**, plus a `base` footprint
-polygon. These are painted in ascending t (one fill layer, data-driven colour), so the
-visible colour at any point is the colour of the band floor(T) to floor(T)+1:
+polygon. These are painted in ascending t, so the visible colour at any point is the
+colour of the band floor(T) to floor(T)+1:
 
 * Gaps between bands are impossible. Every point inside the domain is covered by the
   base polygon and by each level below its temperature.
 * Each isotherm is stored once, not twice as with isobands. The bands are drawn
   without outline strokes.
+* Because levels are stacked, each ring can be simplified on its own without opening
+  gaps. Rings are thinned with Douglas-Peucker at 0.3 px of their own zoom (in
+  overzoomed px at z9); a ring that would collapse keeps its original shape, so no
+  feature is ever removed.
+* The client draws one fill layer per degree with a constant colour. MapLibre renders
+  constant opaque fills in its opaque pass (top layer first, depth-tested), so hidden
+  lower levels are rejected by the GPU instead of being blended once per degree.
 * A separate, lightly simplified `labels` line layer is used only for text placement:
   every 10° at z<5.5, every 5° to z8, then every 1°.
 
@@ -59,9 +66,17 @@ packs and glyphs instead, for hosts that only serve text.
 
 | zoom | tiles | avg tile (gz) |
 |---|---|---|
-| 2–4 | 16 | 290–900 KB |
-| 5–6 | 122 | 75–120 KB |
-| 7–8 | 1567 | 23–48 KB |
-| 9 | 4754 | ~15 KB |
+| 2–4 | 16 | 200–540 KB |
+| 5–6 | 122 | 46–95 KB |
+| 7–8 | 1567 | 13–30 KB |
+| 9 | 4754 | ~9 KB |
 
-Total ≈ 130 MB for all of CONUS down to z9. A typical view loads 1–3 MB.
+Total ≈ 82 MB for all of CONUS down to z9. A whole-US view loads one 1.1–2.0 MB pack.
+
+### Build speed
+
+Tiles are independent, so `build_tiles.py` runs one process per core (biggest tiles
+first). Each worker is pinned to one BLAS/OpenMP thread: letting every worker also
+spawn a thread per core oversubscribed the CPU and more than doubled the build time.
+Ring cleanup and MVT encoding are vectorised with numpy, so the remaining time is
+mostly contourpy, GEOS and PROJ (C/C++).

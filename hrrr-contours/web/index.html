@@ -322,12 +322,24 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
   // readout: the band at a point is the highest superlevel polygon that contains it
   const val = document.getElementById("val"), sub = document.getElementById("sub"), cur = document.getElementById("cursor");
   let pending = null;
+  // Levels are nested ({T >= t} shrinks as t grows), so "inside level i" is
+  // monotonic: binary-search ~7 single-layer queries instead of querying all.
+  const hit = (pt, id) => map.queryRenderedFeatures(pt, { layers: [id] });
+  function bandAt(pt) {
+    const base = hit(pt, "base");
+    if (!base.length) return null;
+    let a = 0, b = levelIds.length - 1, best = null;
+    while (a <= b) {
+      const m = (a + b) >> 1, f = hit(pt, levelIds[m]);
+      if (f.length) { best = f[0].properties.t; a = m + 1; } else b = m - 1;
+    }
+    return best ?? base[0].properties.t;
+  }
   function readout(pt, lngLat) {
-    const fs = map.queryRenderedFeatures(pt, { layers: ["base", ...levelIds] });
-    if (!fs.length) {
+    const t = bandAt(pt);
+    if (t === null) {
       val.innerHTML = "––<small>°F</small>"; sub.innerHTML = "Outside the<br>HRRR domain"; cur.style.display = "none"; return;
     }
-    const t = Math.max(...fs.map((f) => f.properties.t));
     const c = (f) => ((f - 32) * 5 / 9).toFixed(1);
     val.innerHTML = `${t}–${t + 1}<small>°F</small>`;
     sub.innerHTML = `${c(t)} to ${c(t + 1)} °C<br>${Math.abs(lngLat.lat).toFixed(2)}°${lngLat.lat >= 0 ? "N" : "S"} ${Math.abs(lngLat.lng).toFixed(2)}°${lngLat.lng >= 0 ? "E" : "W"}`;
@@ -355,6 +367,7 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
     };
   }
   window.map = map;
+  window.bandAt = bandAt;
 })();
 </script>
 </body>
