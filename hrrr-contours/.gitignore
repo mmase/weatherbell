@@ -3,3 +3,4 @@ data/
 web/tiles/
 web/boundaries.json
 __pycache__/
+web/live/run/

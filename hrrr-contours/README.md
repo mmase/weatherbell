@@ -80,3 +80,50 @@ first). Each worker is pinned to one BLAS/OpenMP thread: letting every worker al
 spawn a thread per core oversubscribed the CPU and more than doubled the build time.
 Ring cleanup and MVT encoding are vectorised with numpy, so the remaining time is
 mostly contourpy, GEOS and PROJ (C/C++).
+
+## Live forecast map (`web/live/`, prototype)
+
+A second page aimed at publishing a model run within seconds of its release and
+animating it. The server does as little as possible; each device contours what
+it is looking at.
+
+```
+python3 scripts/publish_grids.py --hours 0-12 --tiles-maxzoom 6   # latest run
+npx http-server web -p 8080                                        # open /live/
+```
+
+**Server, per forecast hour** (`publish_grids.py`): range-fetch the 2 m temperature
+message, store it as row-delta int16 tenths of °F, gzip (~1.4 MB, ~1–2 s), then build
+the z2–z6 tiles from that same grid (~11 s on 4 cores, ~11 MB). Hours run as soon as
+their `.idx` appears, so in production this hangs off NOAA's new-object notifications.
+
+**Browser** (`contour.js`, `worker.js`):
+
+* z2–z6: the server tiles, one constant-colour MapLibre fill layer per degree.
+* z7 and up: a WebGL2 custom layer. A pool of module workers contours each visible
+  tile from the grid with the same lattice rule as the server (never coarser than the
+  native grid, Keys bicubic below it). Each lattice cell is split into two triangles
+  and each triangle is cut into 1° slabs (convex, so each piece is a fan). The output
+  is triangles directly, so there is no polygon assembly or earcut step. Boundary
+  points on a shared edge are computed from the edge's endpoints in a fixed order, so
+  neighbours meet exactly. Uniform areas are merged with a quadtree whose blocks keep
+  every perimeter vertex (no T-junction cracks). Bands use WebGL2 `flat` shading, and
+  the palette is shared with the tile layers so there is no colour jump at z7. There
+  is no zoom cap.
+* Playback: every zoom switches to the WebGL layer with a coarser lattice (4 px), and
+  the two neighbouring forecast hours are blended before contouring, so bands morph
+  between hours. A new frame is requested only after the previous one has been
+  drawn, so slower devices show fewer in-between frames instead of falling behind.
+* The readout samples the grid (bicubic), so it shows the actual value, e.g. 62.4 °F.
+
+Measured in this repo's container (Node / headless Chromium, 4 vCPU):
+
+| | |
+|---|---|
+| Publish one hour (grid) | 1–2 s |
+| Publish one hour (grid + z2–z6 tiles) | ~13 s |
+| Worker time per tile, z12 / z8 / z4 during playback | 11 / 31 / 58 ms |
+| GPU data per tile at z9 / z12 | ~5 / ~3 MB |
+
+Not done yet: contour labels above z6, real-device GPU frame-rate measurements (the
+container only has a software rasteriser), and tuning for low-memory phones.

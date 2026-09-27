@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HRRR Live Isotherms</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,400..700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --panel: rgba(246, 248, 250, 0.92);
+  --panel-solid: #f6f8fa;
+  --ink: #15202b;
+  --muted: #5a6776;
+  --rule: #d3dae2;
+  --accent: #1d6fd1;
+  --water: #c9d6e0;
+  --land: #e4e6e1;
+  --border: rgba(18, 24, 33, 0.62);
+  --label: #121821;
+  --halo: rgba(255, 255, 255, 0.78);
+  --ui: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --panel: rgba(16, 21, 28, 0.9);
+    --panel-solid: #10151c;
+    --ink: #e5eaf0;
+    --muted: #8e9bab;
+    --rule: #28313d;
+    --accent: #6eaaf5;
+    --water: #0c1117;
+    --land: #1a1f26;
+    --border: rgba(10, 12, 16, 0.75);
+    --label: #0d1117;
+    --halo: rgba(255, 255, 255, 0.7);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --panel: rgba(16, 21, 28, 0.9);
+  --panel-solid: #10151c;
+  --ink: #e5eaf0;
+  --muted: #8e9bab;
+  --rule: #28313d;
+  --accent: #6eaaf5;
+  --water: #0c1117;
+  --land: #1a1f26;
+  --border: rgba(10, 12, 16, 0.75);
+  --label: #0d1117;
+  --halo: rgba(255, 255, 255, 0.7);
+}
+html, body { height: 100%; margin: 0; }
+body { background: var(--water); color: var(--ink); font: 14px/1.4 var(--ui); overflow: hidden; }
+#map { position: absolute; inset: 0; }
+
+/* the few MapLibre rules the page needs (its stylesheet is not loaded) */
+.maplibregl-map { overflow: hidden; position: relative; -webkit-tap-highlight-color: transparent; }
+.maplibregl-canvas { position: absolute; left: 0; top: 0; }
+.maplibregl-canvas-container.maplibregl-interactive { cursor: crosshair; }
+.maplibregl-canvas-container.maplibregl-interactive:active { cursor: grabbing; }
+.maplibregl-ctrl-bottom-left, .maplibregl-ctrl-bottom-right, .maplibregl-ctrl-top-left, .maplibregl-ctrl-top-right { display: none; }
+
+.panel {
+  position: absolute; z-index: 2;
+  background: var(--panel); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--rule); border-radius: 6px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.08), 0 6px 24px rgba(0,0,0,.10);
+}
+#info {
+  top: calc(16px + env(safe-area-inset-top, 0px)); left: 16px;
+  width: min(292px, calc(100vw - 32px)); padding: 14px 16px 12px;
+  display: grid; gap: 10px;
+}
+.eyebrow { font: 600 11px/1 var(--ui); font-stretch: 80%; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing: -.005em; text-wrap: balance; }
+.run { font: 400 12px/1.35 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.readout { display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: 2px 12px; padding-top: 10px; border-top: 1px solid var(--rule); }
+#val { font: 500 30px/1 var(--mono); letter-spacing: -.02em; font-variant-numeric: tabular-nums; min-width: 5.2ch; }
+#val small { font-size: 15px; color: var(--muted); margin-left: 1px; }
+#sub { font: 400 12px/1.35 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.toggles { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  font: 500 12px/1 var(--ui); font-stretch: 88%; color: var(--ink);
+  background: transparent; border: 1px solid var(--rule); border-radius: 999px;
+  padding: 6px 10px 6px 8px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+}
+.chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--muted); }
+.chip[aria-pressed="true"]::before { background: var(--accent); border-color: var(--accent); }
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.credit { font-size: 11px; color: var(--muted); line-height: 1.35; }
+.credit a { color: inherit; }
+
+#legend {
+  left: 50%; transform: translateX(-50%);
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  width: min(640px, calc(100vw - 32px)); padding: 10px 14px 8px; box-sizing: border-box;
+}
+#legend .head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+#bar { position: relative; height: 14px; border-radius: 2px; }
+#bar canvas { width: 100%; height: 100%; display: block; border-radius: 2px; }
+#cursor { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--ink); box-shadow: 0 0 0 1.5px var(--panel-solid); display: none; }
+#ticks { position: relative; height: 16px; margin-top: 3px; font: 400 11px/16px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+#ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+#ticks span.frz { color: var(--accent); font-weight: 500; }
+
+#zoom { position: absolute; z-index: 2; right: 16px; top: calc(16px + env(safe-area-inset-top, 0px)); display: grid; }
+#zoom button { width: 34px; height: 34px; font: 500 18px/1 var(--mono); color: var(--ink); background: var(--panel); border: 1px solid var(--rule); cursor: pointer; }
+#zoom button:first-child { border-radius: 6px 6px 0 0; border-bottom: none; }
+#zoom button:last-child { border-radius: 0 0 6px 6px; }
+#zoom button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+#zl { position: absolute; z-index: 2; right: 16px; top: calc(92px + env(safe-area-inset-top, 0px)); font: 400 11px var(--mono); color: var(--muted); background: var(--panel); padding: 3px 6px; border-radius: 4px; border: 1px solid var(--rule); }
+
+@media (max-width: 560px) {
+  #info { padding: 10px 12px; gap: 8px; width: calc(100vw - 32px - 50px); }
+  h1 { font-size: 17px; }
+  #val { font-size: 24px; }
+  .credit { display: none; }
+}
+
+/* timeline */
+.timeline { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; margin-bottom: 8px; }
+#play { width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--rule); background: var(--panel-solid); color: var(--ink); cursor: pointer; font: 500 12px/1 var(--mono); }
+#play:focus-visible, #hour:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#hour { width: 100%; accent-color: var(--accent); }
+#valid { font: 500 12px/1.2 var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+#valid small { display: block; color: var(--muted); font-weight: 400; }
+#perf { position: absolute; z-index: 2; right: 16px; top: calc(122px + env(safe-area-inset-top, 0px)); font: 400 11px/1.4 var(--mono); color: var(--muted); background: var(--panel); padding: 3px 6px; border-radius: 4px; border: 1px solid var(--rule); white-space: pre; }
+</style>
+</head>
+<body>
+<div id="map" role="application" aria-label="Map of HRRR 2 metre temperature forecast with 1 degree bands"></div>
+
+<section id="info" class="panel" aria-live="polite">
+  <div>
+    <div class="eyebrow">HRRR · CONUS 3 km · Forecast</div>
+    <h1>2 m Air Temperature</h1>
+    <div class="run" id="run">Loading…</div>
+  </div>
+  <div class="readout">
+    <div id="val">––<small>°F</small></div>
+    <div id="sub">Hover or tap<br>the map</div>
+  </div>
+  <div class="toggles">
+    <button class="chip" id="t-labels" aria-pressed="true">Labels</button>
+    <button class="chip" id="t-borders" aria-pressed="true">Borders</button>
+  </div>
+  <div class="credit">Vector bands every 1&nbsp;°F. Zoomed out: tiles built when the run is published. Zoomed in and during playback: contoured on this device from the model grid. Data: NOAA/NCEP HRRR via <a href="https://registry.opendata.aws/noaa-hrrr-pds/" target="_blank" rel="noopener">AWS Open Data</a>. Boundaries: Natural Earth, US Census.</div>
+</section>
+
+<div id="zoom"><button id="zin" aria-label="Zoom in">+</button><button id="zout" aria-label="Zoom out">−</button></div>
+<div id="zl">z 4.0</div>
+<div id="perf" hidden></div>
+
+<section id="legend" class="panel" aria-label="Forecast time and temperature colour scale">
+  <div class="timeline">
+    <button id="play" aria-label="Play forecast">▶</button>
+    <input id="hour" type="range" min="0" max="12" step="1" value="0" aria-label="Forecast hour">
+    <div id="valid">––<small>––</small></div>
+  </div>
+  <div class="head"><span class="eyebrow">Temperature °F · 1° bands</span><span class="eyebrow" id="range"></span></div>
+  <div id="bar"><canvas id="barc" width="600" height="1"></canvas><div id="cursor"></div></div>
+  <div id="ticks"></div>
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.9.0/dist/maplibre-gl.js"></script>
+<script type="module">
+import { Grid, sample } from "./contour.js";
+
+// ------------------------------------------------------------------ colours
+// One palette shared by the tile layers and the WebGL layer (CIELAB blend).
+const STOPS = [
+  [-40, "#f1e6f5"], [-20, "#c7a4d8"], [0, "#7b4fa6"], [10, "#4b3f9e"], [20, "#2c5aa8"],
+  [32, "#3d93d1"], [40, "#72c6cf"], [50, "#58b37a"], [60, "#9ccb52"], [70, "#eadb55"],
+  [80, "#f5a940"], [90, "#e66a31"], [100, "#c42a2c"], [110, "#8e1239"], [120, "#e6a3c3"],
+];
+const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+const lin = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+const gam = (c) => 255 * (c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055);
+const XN = 0.95047, ZN = 1.08883;
+function toLab([r, g, b]) {
+  r = lin(r); g = lin(g); b = lin(b);
+  const f = (t) => (t > 216 / 24389 ? Math.cbrt(t) : (24389 / 27 * t + 16) / 116);
+  const x = f((0.4124 * r + 0.3576 * g + 0.1805 * b) / XN), y = f(0.2126 * r + 0.7152 * g + 0.0722 * b), z = f((0.0193 * r + 0.1192 * g + 0.9505 * b) / ZN);
+  return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
+}
+function fromLab([L, a, bb]) {
+  const fy = (L + 16) / 116, fx = fy + a / 500, fz = fy - bb / 200;
+  const inv = (t) => (t ** 3 > 216 / 24389 ? t ** 3 : (116 * t - 16) / (24389 / 27));
+  const x = XN * inv(fx), y = inv(fy), z = ZN * inv(fz);
+  const r = 3.2406 * x - 1.5372 * y - 0.4986 * z, g = -0.9689 * x + 1.8758 * y + 0.0415 * z, b = 0.0557 * x - 0.2040 * y + 1.0570 * z;
+  return [r, g, b].map((c) => Math.max(0, Math.min(255, Math.round(gam(Math.max(0, c))))));
+}
+const LABS = STOPS.map(([t, c]) => [t, toLab(hex(c))]);
+function colorAt(v) {
+  if (v <= LABS[0][0]) return fromLab(LABS[0][1]);
+  for (let i = 1; i < LABS.length; i++) {
+    if (v <= LABS[i][0]) {
+      const [a, A] = LABS[i - 1], [b, B] = LABS[i], f = (v - a) / (b - a);
+      return fromLab(A.map((x, k) => x + (B[k] - x) * f));
+    }
+  }
+  return fromLab(LABS[LABS.length - 1][1]);
+}
+const BAND0 = -60; // palette texel 0 = band -60 degF
+const bandRGB = (t) => colorAt(t + 0.5);
+const rgbStr = ([r, g, b]) => `rgb(${r},${g},${b})`;
+
+// ------------------------------------------------------------------ data
+const meta = await (await fetch("run/meta.json")).json();
+const b64 = meta.encoding === "base64";
+async function fetchBin(path) {
+  const r = await fetch(b64 ? path.replace(/\.\w+$/, ".txt").replace(/\.i16\.txt$/, ".txt") : path);
+  if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
+  if (!b64) return r.arrayBuffer();
+  const s = (await r.text()).trim();
+  if (Uint8Array.fromBase64) return Uint8Array.fromBase64(s).buffer;
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+const inflate = async (buf) => new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+const HOURS = meta.hours, NX = meta.nx, NY = meta.ny;
+const hh = (h) => String(h).padStart(2, "0");
+const fieldCache = new Map(); // hour -> Promise<Int16Array> (decoded: degF * scale)
+function field(h) {
+  if (!fieldCache.has(h)) {
+    fieldCache.set(h, fetchBin(`run/grids/f${hh(h)}.i16.gz`).then(inflate).then((buf) => {
+      const d = new Int16Array(buf);
+      for (let r = 0; r < NY; r++) for (let c = 1, o = r * NX; c < NX; c++) d[o + c] += d[o + c - 1]; // undo row deltas
+      return d;
+    }));
+  }
+  return fieldCache.get(h);
+}
+const grid = new Grid(meta, { positions: false }); // projection only, for the readout
+
+// ------------------------------------------------------------------ workers
+const NW = Math.max(1, Math.min(6, (navigator.hardwareConcurrency || 4) - 1));
+const pool = [];
+const jobs = new Map(); // id -> {resolve}
+let nextId = 1;
+for (let i = 0; i < NW; i++) {
+  const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+  const entry = { w, inflight: 0, hours: [] };
+  w.onmessage = (e) => {
+    const m = e.data;
+    if (m.type !== "tile") return;
+    entry.inflight--;
+    const j = jobs.get(m.id); jobs.delete(m.id);
+    j && j.resolve(m);
+  };
+  w.postMessage({ type: "meta", meta });
+  pool.push(entry);
+}
+async function contour(job) {
+  const need = [job.hA, job.hB].filter((h) => h != null);
+  const data = await Promise.all(need.map(field));
+  const e = pool.reduce((a, b) => (b.inflight < a.inflight ? b : a));
+  need.forEach((h, i) => {
+    if (e.hours.includes(h)) return;
+    e.w.postMessage({ type: "field", hour: h, buf: data[i].buffer.slice(0) });
+    e.hours.push(h); if (e.hours.length > 6) e.hours.shift(); // mirrors the worker's LRU
+  });
+  e.inflight++;
+  const id = nextId++;
+  return new Promise((resolve) => { jobs.set(id, { resolve }); e.w.postMessage({ type: "tile", id, ...job }); });
+}
+
+// ------------------------------------------------------------------ state
+const CLIENT_MIN = meta.tiles ? meta.tiles.maxzoom + 1 : 0; // client contours from this zoom up
+const STATIC_PX = 2, PLAY_PX = 4;                             // lattice spacing, CSS px
+let hour = HOURS[0], playing = false, playT = 0;
+let frame = { hA: hour, hB: null, w: 0, px: STATIC_PX, coarse: false };
+const frameKey = (f) => `${f.hA}|${f.hB}|${f.w.toFixed(3)}|${f.px}`;
+
+// ------------------------------------------------------------------ WebGL layer
+const VS = `#version 300 es
+in vec2 a_pos; in int a_band;
+uniform mat4 u_matrix;
+flat out int v_band;
+void main() { gl_Position = u_matrix * vec4(a_pos * 2.0 - 0.25, 0.0, 1.0); v_band = a_band; }`;
+const FS = `#version 300 es
+precision highp float;
+flat in int v_band; uniform sampler2D u_pal; out vec4 color;
+void main() { color = texelFetch(u_pal, ivec2(clamp(v_band - ${BAND0}, 0, 255), 0), 0); }`;
+
+const cache = new Map();    // tileKey -> {vao, bufs, count, bytes, used}
+const inflight = new Set();
+let shown = [];             // last complete set of tile keys
+let displayed = null;       // frameKey of the last frame drawn complete
+let cachedBytes = 0;
+const GPU_BUDGET = (navigator.deviceMemory && navigator.deviceMemory <= 4 ? 160 : 384) * 1e6;
+const stats = { tiles: 0, ms: 0, tris: 0 };
+
+function visibleTiles(map, f) {
+  const z = Math.max(0, Math.min(18, Math.round(map.getZoom())));
+  const n = 2 ** z, b = map.getBounds();
+  const tx = (lon) => Math.floor((lon + 180) / 360 * n);
+  const ty = (lat) => Math.floor((1 - Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360)) / Math.PI) / 2 * n);
+  const x0 = Math.max(tx(Math.max(b.getWest(), DOMAIN.w)), 0), x1 = Math.min(tx(Math.min(b.getEast(), DOMAIN.e)), n - 1);
+  const y0 = Math.max(ty(Math.min(b.getNorth(), DOMAIN.n)), 0), y1 = Math.min(ty(Math.max(b.getSouth(), DOMAIN.s)), n - 1);
+  const c = map.getCenter(), cx = (c.lng + 180) / 360 * n, cy = (1 - Math.log(Math.tan(Math.PI / 4 + c.lat * Math.PI / 360)) / Math.PI) / 2 * n;
+  const out = [];
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) out.push({ z, x, y, d: (x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 });
+  out.sort((a, b) => a.d - b.d);
+  const fk = frameKey(f);
+  return out.map((t) => ({ ...t, key: `${fk}|${t.z}/${t.x}/${t.y}` }));
+}
+
+const live = {
+  id: "live", type: "custom", renderingMode: "2d",
+  onAdd(map, gl) {
+    this.map = map; this.gl = gl;
+    const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+    const p = gl.createProgram();
+    gl.attachShader(p, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, FS));
+    gl.bindAttribLocation(p, 0, "a_pos"); gl.bindAttribLocation(p, 1, "a_band");
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    this.prog = p; this.uMatrix = gl.getUniformLocation(p, "u_matrix"); this.uPal = gl.getUniformLocation(p, "u_pal");
+    const pal = new Uint8Array(256 * 4);
+    for (let i = 0; i < 256; i++) { const [r, g, b] = bandRGB(BAND0 + i); pal.set([r, g, b, 255], i * 4); }
+    this.tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pal);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  },
+  upload(key, m, z, x, y) {
+    const gl = this.gl, vao = gl.createVertexArray(), bufs = [gl.createBuffer(), gl.createBuffer(), gl.createBuffer()];
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, bufs[0]); gl.bufferData(gl.ARRAY_BUFFER, m.pos, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.UNSIGNED_SHORT, true, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, bufs[1]); gl.bufferData(gl.ARRAY_BUFFER, m.band, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(1); gl.vertexAttribIPointer(1, 1, gl.SHORT, 0, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bufs[2]); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.index, gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+    const bytes = m.pos.byteLength + m.band.byteLength + m.index.byteLength;
+    cache.set(key, { vao, bufs, count: m.index.length, bytes, used: performance.now(), z, x, y });
+    cachedBytes += bytes;
+  },
+  evict(keep) {
+    if (cachedBytes <= GPU_BUDGET) return;
+    const gl = this.gl;
+    const old = [...cache.entries()].filter(([k]) => !keep.has(k)).sort((a, b) => a[1].used - b[1].used);
+    for (const [k, t] of old) {
+      if (cachedBytes <= GPU_BUDGET * 0.8) break;
+      gl.deleteVertexArray(t.vao); t.bufs.forEach((b) => gl.deleteBuffer(b));
+      cachedBytes -= t.bytes; cache.delete(k);
+    }
+  },
+  drop(pred) {
+    const gl = this.gl;
+    for (const [k, t] of cache) {
+      if (!pred(k)) continue;
+      if (t.vao) { gl.deleteVertexArray(t.vao); t.bufs.forEach((b) => gl.deleteBuffer(b)); }
+      cachedBytes -= t.bytes; cache.delete(k);
+    }
+  },
+  active() { return playing || this.map.getZoom() >= CLIENT_MIN; },
+  render(gl, opts) {
+    if (!this.active()) return;
+    const map = this.map, f = frame;
+    const want = visibleTiles(map, f);
+    let ready = 0;
+    for (const t of want) {
+      if (cache.has(t.key)) { ready++; continue; }
+      if (inflight.has(t.key) || inflight.size >= NW * 2) continue;
+      inflight.add(t.key);
+      const t0 = performance.now();
+      contour({ hA: f.hA, hB: f.hB, w: f.w, z: t.z, x: t.x, y: t.y, spacing: f.px, allowCoarse: f.coarse }).then((m) => {
+        inflight.delete(t.key);
+        if (!m.empty && !m.missing) {
+          this.upload(t.key, m, t.z, t.x, t.y);
+          stats.tiles++; stats.ms += m.ms; stats.tris += m.index.length / 3;
+        } else if (m.missing) window.__live.missing++;
+        else if (m.empty) cache.set(t.key, { count: 0, bytes: 0, used: performance.now(), z: t.z, x: t.x, y: t.y });
+        map.triggerRepaint();
+      });
+    }
+    if (ready === want.length) { shown = want.map((t) => t.key); displayed = frameKey(f); }
+    // while playing, keep the previous complete frame until the next is complete;
+    // otherwise draw what's ready on top of it (pans fill in tile by tile)
+    const draw = playing ? shown : [...new Set([...shown, ...want.filter((t) => cache.has(t.key)).map((t) => t.key)])];
+    const M = opts.defaultProjectionData.mainMatrix; // web mercator 0..1 -> clip, float64
+    gl.useProgram(this.prog);
+    gl.disable(gl.DEPTH_TEST); gl.disable(gl.STENCIL_TEST); gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex); gl.uniform1i(this.uPal, 0);
+    const now = performance.now(), m = new Float32Array(16);
+    for (const key of draw) {
+      const t = cache.get(key);
+      if (!t || !t.count) continue;
+      t.used = now;
+      // matrix for tile-local 0..1 coordinates: M * translate(x/2^z, y/2^z) * scale(1/2^z)
+      const s = 1 / 2 ** t.z, tx = t.x * s, ty = t.y * s;
+      for (let i = 0; i < 4; i++) {
+        m[i] = M[i] * s; m[4 + i] = M[4 + i] * s; m[8 + i] = M[8 + i];
+        m[12 + i] = M[i] * tx + M[4 + i] * ty + M[12 + i];
+      }
+      gl.uniformMatrix4fv(this.uMatrix, false, m);
+      gl.bindVertexArray(t.vao);
+      gl.drawElements(gl.TRIANGLES, t.count, gl.UNSIGNED_INT, 0);
+    }
+    gl.bindVertexArray(null);
+    const keep = new Set([...draw, ...want.map((t) => t.key)]);
+    if (playing) this.drop((k) => !keep.has(k)); // frames already played are never reused
+    this.evict(keep);
+    if (!playing && ready < want.length) map.triggerRepaint();
+    perfEl.hidden = false;
+    perfEl.textContent = `device contouring\n${stats.tiles} tiles · ${(stats.ms / Math.max(1, stats.tiles)).toFixed(0)} ms avg\nGPU cache ${(cachedBytes / 1e6).toFixed(0)} MB`;
+  },
+};
+
+// domain bounds (for choosing tiles)
+const DOMAIN = (() => {
+  const g = new Grid(meta, { positions: false });
+  let w = 180, e = -180, s = 90, n = -90;
+  for (let k = 0; k <= 64; k++) {
+    for (const [i, j] of [[k / 64 * (NX - 1), 0], [k / 64 * (NX - 1), NY - 1], [0, k / 64 * (NY - 1)], [NX - 1, k / 64 * (NY - 1)]]) {
+      const [mx, my] = g.nodeMerc(i, j);
+      const lon = mx * 360 - 180, lat = Math.atan(Math.sinh(Math.PI * (1 - 2 * my))) * 180 / Math.PI;
+      w = Math.min(w, lon); e = Math.max(e, lon); s = Math.min(s, lat); n = Math.max(n, lat);
+    }
+  }
+  return { w, e, s, n };
+})();
+
+// ------------------------------------------------------------------ server tiles (zoomed out)
+const packs = new Map(), packBytes = new Map(), PACK_BUDGET = 48e6; let packCached = 0;
+const packKey = (z, x, y) => (z <= 4 ? `${z}-0-0` : `5-${x >> (z - 5)}-${y >> (z - 5)}`);
+function getPack(h, key) {
+  const id = `${h}/${key}`;
+  let p = packs.get(id);
+  if (p) { packs.delete(id); packs.set(id, p); return p; }
+  p = fetchBin(`run/tiles/f${hh(h)}/${key}.bin`).then((buf) => {
+    const dv = new DataView(buf), n = dv.getUint32(0, true), index = new Map();
+    for (let i = 0, o = 4; i < n; i++, o += 20)
+      index.set(`${dv.getUint32(o, true)}/${dv.getUint32(o + 4, true)}/${dv.getUint32(o + 8, true)}`, [dv.getUint32(o + 12, true), dv.getUint32(o + 16, true)]);
+    if (packs.get(id) === p) {
+      packBytes.set(id, buf.byteLength); packCached += buf.byteLength;
+      for (const k of packs.keys()) { if (packCached <= PACK_BUDGET || k === id) break; packCached -= packBytes.get(k) || 0; packBytes.delete(k); packs.delete(k); }
+    }
+    return { buf, index };
+  });
+  p.catch(() => packs.delete(id));
+  packs.set(id, p);
+  return p;
+}
+maplibregl.addProtocol("hrrr", async (params) => {
+  const [h, z, x, y] = params.url.slice(7).split("/").map(Number);
+  const key = packKey(z, x, y);
+  if (!meta.tiles || !meta.tiles.packs[hh(h)].includes(key)) return { data: new ArrayBuffer(0) };
+  const { buf, index } = await getPack(h, key);
+  const e = index.get(`${z}/${x}/${y}`);
+  if (!e) return { data: new ArrayBuffer(0) };
+  return { data: await inflate(new Uint8Array(buf, e[0], e[1])) };
+});
+maplibregl.addProtocol("hrrrglyph", async (params) =>
+  ({ data: await fetchBin(`../glyphs/${decodeURIComponent(params.url.slice(12))}.pbf`) }));
+
+// ------------------------------------------------------------------ map
+const css = () => { const s = getComputedStyle(document.documentElement); return (n) => s.getPropertyValue(n).trim(); };
+const v = css();
+const zw = (pairs) => ["interpolate", ["exponential", 1.6], ["zoom"], ...pairs.flat()];
+const lo = Math.floor(meta.tmin) - 1, hi = Math.ceil(meta.tmax) + 1;
+const levelIds = [];
+for (let t = lo; t <= hi; t++) levelIds.push(`lvl${t}`);
+const tileLayerMax = CLIENT_MIN;
+const labelLayer = (id, minzoom, maxzoom, filter) => ({
+  id, type: "symbol", source: "t2m", "source-layer": "labels", minzoom, maxzoom: Math.min(maxzoom, tileLayerMax), filter,
+  layout: {
+    "symbol-placement": "line", "symbol-spacing": ["interpolate", ["linear"], ["zoom"], 3, 220, 10, 420],
+    "text-field": ["concat", ["to-string", ["get", "t"]], "°"], "text-font": ["DejaVu Sans Bold"],
+    "text-size": ["interpolate", ["linear"], ["zoom"], 3, 10, 10, 12.5], "text-max-angle": 40,
+    "text-keep-upright": true, "text-rotation-alignment": "map", "text-padding": 4,
+  },
+  paint: { "text-color": v("--label"), "text-halo-color": v("--halo"), "text-halo-width": 1.4, "text-halo-blur": 0.4 },
+});
+const map = new maplibregl.Map({
+  container: "map", antialias: true,
+  center: [-97.5, 38.6], zoom: window.innerWidth < 600 ? 2.6 : 3.9, minZoom: 2, maxZoom: 16,
+  renderWorldCopies: false, attributionControl: false, dragRotate: false, pitchWithRotate: false,
+  maxBounds: [[-160, 5], [-35, 65]],
+  style: {
+    version: 8,
+    glyphs: "hrrrglyph://{fontstack}/{range}",
+    sources: {
+      t2m: { type: "vector", tiles: [`hrrr://${hour}/{z}/{x}/{y}`], minzoom: 2, maxzoom: meta.tiles ? meta.tiles.maxzoom : 2 },
+      geo: { type: "geojson", data: new URL("../boundaries.json", location.href).href, tolerance: 0.25 },
+    },
+    layers: [
+      { id: "bg", type: "background", paint: { "background-color": v("--water") } },
+      { id: "land", type: "fill", source: "geo", filter: ["==", ["get", "kind"], "land"], paint: { "fill-color": v("--land") } },
+      { id: "base", type: "fill", source: "t2m", "source-layer": "base", maxzoom: tileLayerMax,
+        paint: { "fill-color": ["match", ["get", "t"], ...levelIds.flatMap((_, i) => [lo + i, rgbStr(bandRGB(lo + i))]), "#000"], "fill-antialias": false } },
+      // one constant-colour layer per degree: MapLibre's opaque pass, GPU rejects hidden levels
+      ...levelIds.map((id, i) => ({
+        id, type: "fill", source: "t2m", "source-layer": "levels", maxzoom: tileLayerMax, filter: ["==", ["get", "t"], lo + i],
+        paint: { "fill-color": rgbStr(bandRGB(lo + i)), "fill-antialias": true },
+      })),
+      { id: "coast", type: "line", source: "geo", filter: ["in", ["get", "kind"], ["literal", ["coast", "country"]]],
+        paint: { "line-color": v("--border"), "line-width": zw([[3, 0.7], [8, 1.4], [12, 2]]) } },
+      { id: "state", type: "line", source: "geo", filter: ["==", ["get", "kind"], "state"],
+        paint: { "line-color": v("--border"), "line-width": zw([[3, 0.45], [8, 1], [12, 1.4]]), "line-dasharray": [3, 1.5] } },
+      labelLayer("lab10", 0, 5.5, ["==", ["%", ["get", "t"], 10], 0]),
+      labelLayer("lab5", 5.5, 8, ["==", ["%", ["get", "t"], 5], 0]),
+    ],
+  },
+});
+map.on("load", () => map.addLayer(live, "coast"));
+window.map = map;
+window.__live = { get frame() { return frame; }, cache, inflight, get shown() { return shown; }, stats, missing: 0, frames: 0 };
+const perfEl = document.getElementById("perf");
+
+// tile layers are hidden while playing (the WebGL layer draws every zoom then)
+function setTileLayers(on) {
+  for (const id of ["base", ...levelIds, "lab10", "lab5"]) map.setLayoutProperty(id, "visibility", on ? "visible" : "none");
+}
+
+// ------------------------------------------------------------------ timeline
+const run = new Date(meta.run);
+const fmt = (d) => d.toLocaleString("en-US", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }) + "Z";
+document.getElementById("run").textContent = `Run ${fmt(run)} · f${hh(HOURS[0])}–f${hh(HOURS[HOURS.length - 1])}`;
+const slider = document.getElementById("hour"), validEl = document.getElementById("valid"), playBtn = document.getElementById("play");
+slider.min = HOURS[0]; slider.max = HOURS[HOURS.length - 1];
+function showValid(t) {
+  const d = new Date(run.getTime() + t * 3600e3);
+  validEl.innerHTML = `${fmt(d)}<small>+${t.toFixed(t % 1 ? 1 : 0)} h</small>`;
+}
+function setHour(h) {
+  hour = h; slider.value = h; showValid(h);
+  frame = { hA: h, hB: null, w: 0, px: STATIC_PX, coarse: false };
+  map.getSource("t2m").setTiles([`hrrr://${h}/{z}/{x}/{y}`]);
+  map.triggerRepaint();
+  field(h).then(() => lastPt && readout(lastPt.point, lastPt.lngLat));
+}
+slider.addEventListener("input", () => setHour(+slider.value));
+let lastTick = 0;
+const HOURS_PER_SEC = 1;
+function tick(now) {
+  if (!playing) return;
+  const dt = lastTick ? (now - lastTick) / 1000 : 0; lastTick = now;
+  playT += dt * HOURS_PER_SEC;
+  const last = HOURS[HOURS.length - 1];
+  if (playT >= last) playT = HOURS[0];
+  // advance the requested frame only once the previous one is complete, so
+  // slower devices simply show fewer in-between frames
+  if (displayed === frameKey(frame)) {
+    window.__live.frames++;
+    let hA = Math.floor(playT), w = Math.round((playT - hA) * 16) / 16;
+    if (w >= 1) { hA += 1; w = 0; }
+    frame = w === 0 || hA >= last ? { hA, hB: null, w: 0, px: PLAY_PX, coarse: true } : { hA, hB: hA + 1, w, px: PLAY_PX, coarse: true };
+    slider.value = hA; showValid(hA + w);
+    map.triggerRepaint();
+  }
+  requestAnimationFrame(tick);
+}
+playBtn.addEventListener("click", () => {
+  playing = !playing;
+  playBtn.textContent = playing ? "❚❚" : "▶";
+  playBtn.setAttribute("aria-label", playing ? "Pause forecast" : "Play forecast");
+  if (playing) {
+    HOURS.forEach(field); // prefetch every hour
+    playT = hour; lastTick = 0; setTileLayers(false);
+    requestAnimationFrame(tick);
+  } else {
+    setTileLayers(true);
+    setHour(Math.round(playT) > HOURS[HOURS.length - 1] ? HOURS[0] : Math.round(playT));
+  }
+});
+showValid(hour);
+
+// ------------------------------------------------------------------ legend + readout
+document.getElementById("range").textContent = `${Math.floor(meta.tmin)}° to ${Math.ceil(meta.tmax)}° this run`;
+const lgLo = Math.floor(meta.tmin / 10) * 10, lgHi = Math.ceil(meta.tmax / 10) * 10;
+const bc = document.getElementById("barc"), bctx = bc.getContext("2d");
+bc.width = lgHi - lgLo; bc.style.imageRendering = "pixelated";
+for (let t = lgLo; t < lgHi; t++) { bctx.fillStyle = rgbStr(bandRGB(t)); bctx.fillRect(t - lgLo, 0, 1, 1); }
+const ticks = document.getElementById("ticks");
+const pos = (t) => `${((t - lgLo) / (lgHi - lgLo)) * 100}%`;
+for (let t = lgLo; t <= lgHi; t += 10) { const s = document.createElement("span"); s.style.left = pos(t); s.textContent = t; ticks.append(s); }
+if (32 > lgLo && 32 < lgHi) {
+  const s = document.createElement("span"); s.className = "frz"; s.style.left = pos(32); s.textContent = "32"; ticks.append(s);
+  [...ticks.children].forEach((e) => { if (e.textContent === "30" && !e.className) e.style.visibility = "hidden"; });
+}
+const val = document.getElementById("val"), sub = document.getElementById("sub"), cur = document.getElementById("cursor");
+let lastPt = null, pendingRO = null;
+async function readout(point, lngLat) {
+  lastPt = { point, lngLat };
+  const f = frame, A = await field(f.hA), B = f.hB == null ? null : await field(f.hB);
+  const t = sample(grid, B ? [A, B] : [A], f.w, lngLat.lng, lngLat.lat);
+  if (t == null) { val.innerHTML = "––<small>°F</small>"; sub.innerHTML = "Outside the<br>HRRR domain"; cur.style.display = "none"; return; }
+  const c = ((t - 32) * 5 / 9).toFixed(1);
+  val.innerHTML = `${t.toFixed(1)}<small>°F</small>`;
+  sub.innerHTML = `${c} °C · band ${Math.floor(t)}–${Math.floor(t) + 1}°<br>${Math.abs(lngLat.lat).toFixed(2)}°${lngLat.lat >= 0 ? "N" : "S"} ${Math.abs(lngLat.lng).toFixed(2)}°${lngLat.lng >= 0 ? "E" : "W"}`;
+  cur.style.display = "block"; cur.style.left = pos(t);
+}
+map.on("mousemove", (e) => { if (pendingRO) return; pendingRO = requestAnimationFrame(() => { pendingRO = null; readout(e.point, e.lngLat); }); });
+map.on("click", (e) => readout(e.point, e.lngLat));
+const zl = document.getElementById("zl");
+map.on("zoom", () => { zl.textContent = `z ${map.getZoom().toFixed(1)}`; });
+document.getElementById("zin").onclick = () => map.zoomIn();
+document.getElementById("zout").onclick = () => map.zoomOut();
+const toggles = { "t-labels": ["lab10", "lab5"], "t-borders": ["coast", "state"] };
+for (const [id, layers] of Object.entries(toggles)) {
+  const b = document.getElementById(id);
+  b.onclick = () => { const on = b.getAttribute("aria-pressed") !== "true"; b.setAttribute("aria-pressed", on);
+    layers.forEach((l) => map.setLayoutProperty(l, "visibility", on ? "visible" : "none")); };
+}
+field(hour);
+</script>
+</body>
+</html>

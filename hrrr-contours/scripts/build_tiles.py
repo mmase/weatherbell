@@ -51,6 +51,8 @@ from pyproj import Transformer
 EXTENT = 8192
 BUFFER = 96  # tile units of overlap beyond the tile edge
 MINZOOM, MAXZOOM = 2, 9
+LEVEL_EPS = 1e-4  # contour levels sit this far below each integer (see build_tile)
+TOPZOOM = 9  # the zoom MapLibre overzooms to z13 when tiles are the only renderer
 LABEL_ALL_ZOOM = 7  # from this zoom every 1-degree isoline gets a label line
 LABEL_TOLERANCE = 40  # tile units (~2.5 px) for the label-only line layer
 # Fill simplification, in screen px at the tile's own zoom.  Levels are stacked
@@ -125,9 +127,22 @@ def keys_weights(u, n):
     return W, first + 2  # +2 for padding offset
 
 
+def load_grid(path):
+    """A grid published by publish_grids.py: row-delta int16 (tenths of degF),
+    gzipped, with meta.json alongside.  Same numbers the browser contours."""
+    meta = json.load(open(os.path.join(os.path.dirname(path), "meta.json")))
+    d = np.frombuffer(gzip.decompress(open(path, "rb").read()), dtype="<i2").reshape(meta["ny"], meta["nx"])
+    q = np.cumsum(d, axis=1, dtype=np.int16)  # undo row deltas (wrapping int16 arithmetic)
+    p = meta["proj"]
+    proj = (f"+proj=lcc +lon_0={p['lon0']} +lat_0={p['lat0']} +lat_1={p['lat1']} +lat_2={p['lat2']} "
+            f"+R={p['R']}")
+    return q.astype(np.float64) / meta["scale"], proj, meta["x0"], meta["y0"], meta["dx"]
+
+
 class Field:
     def __init__(self, path):
-        self.F, self.proj, self.x0, self.y0, self.dx = load_field(path)
+        load = load_field if path.endswith(".grib2") else load_grid
+        self.F, self.proj, self.x0, self.y0, self.dx = load(path)
         self.ny, self.nx = self.F.shape
         self.Fp = np.pad(self.F, 2, mode="edge")
         self.to_merc = WebMercator(self.proj, inverse=False)
@@ -138,7 +153,7 @@ class Field:
         # because it is also what MapLibre overzooms (up to 16x) beyond z9.
         # Never coarser than the native 3 km grid, so no model feature is
         # smoothed away at low zooms.
-        return 1.0 / 32.0 if z == MAXZOOM else min(1.0, 2.0 ** (MAXZOOM - z) / 16.0)
+        return 1.0 / 32.0 if z == TOPZOOM else min(1.0, 2.0 ** (TOPZOOM - z) / 16.0)
 
     def lattice(self, z, i0, i1, j0, j1):
         """Field values on the global lattice restricted to grid-index box."""
@@ -329,6 +344,21 @@ def simplify_rings(coords, ring_off, tol):
     return c, off
 
 
+def drop_short_rings(offs, outer):
+    """Remove rings with < 4 points (a polygon whose exterior is short goes too)."""
+    n = np.diff(offs)
+    if (n >= 4).all():
+        return offs, outer  # common case: nothing to drop
+    keep_poly = n[outer[:-1]] >= 4
+    ring_poly = np.repeat(np.arange(len(outer) - 1), np.diff(outer))
+    keep = (n >= 4) & keep_poly[ring_poly]
+    # rebuild offsets into the original points array via index gathering
+    idx = np.concatenate([np.arange(offs[r], offs[r + 1]) for r in np.nonzero(keep)[0]]) if keep.any() else np.zeros(0, int)
+    new_offs = np.concatenate([[0], np.cumsum(n[keep])])
+    new_outer = np.concatenate([[0], np.cumsum(np.bincount(ring_poly[keep], minlength=len(outer) - 1)[keep_poly])])
+    return (new_offs, new_outer, idx)
+
+
 def ragged(geoms, kind):
     """Array of (Multi)Polygons or (Multi)LineStrings -> coords, ring offsets,
     per-geometry ring offsets and (polygons) the exterior flag per ring."""
@@ -398,12 +428,14 @@ def build_tile(zxy):
     # polygon is the data footprint, so the stack covers the domain with no gaps.
     fills, lines = [], []
     for t in range(lo, hi + 1):
-        pts, offs, outer = (c[0] for c in gen.filled(t, top))
+        # Contour just below t: identical membership for data stored in 0.1-degree
+        # steps, but no sample sits exactly on a level (which makes 0-area rings).
+        pts, offs, outer = (c[0] for c in gen.filled(t - LEVEL_EPS, top))
         if pts is not None:
             fills.append((t, pts, offs, outer))
         # Isolines for text placement only (every 5 deg at low zoom).
         if t > lo and (t % 5 == 0 or z >= LABEL_ALL_ZOOM):
-            lp, lo_ = (c[0] for c in gen.lines(t))
+            lp, lo_ = (c[0] for c in gen.lines(t - LEVEL_EPS))
             if lp is not None:
                 lines.append((t, lp, lo_))
     if not fills:
@@ -417,6 +449,12 @@ def build_tile(zxy):
     polys, mls = [], []
     for t, pts, offs, outer in fills:
         c = tp[k:k + len(pts)]; k += len(pts)
+        r = drop_short_rings(offs, outer)
+        if len(r) == 3:
+            offs, outer, idx = r
+            c = c[idx]
+        if len(outer) < 2:
+            continue
         polys.append(shapely.from_ragged_array(
             shapely.GeometryType.MULTIPOLYGON, c, (offs, outer, np.array([0, len(outer) - 1])))[0])
     for t, lp, lo_ in lines:
@@ -425,7 +463,7 @@ def build_tile(zxy):
             shapely.GeometryType.MULTILINESTRING, c, (lo_, np.array([0, len(lo_) - 1])))[0])
 
     rect = (-BUFFER, -BUFFER, EXTENT + BUFFER, EXTENT + BUFFER)
-    px = EXTENT / 512 / (16 if z == MAXZOOM else 1)
+    px = EXTENT / 512 / (16 if z == TOPZOOM else 1)
     tol = max(0.5, SIMPLIFY_PX * px)
     r = ragged(shapely.clip_by_rect(np.array(polys), *rect), "polygon")
     if r is None:
@@ -471,21 +509,23 @@ def domain_tiles(fld, z):
     return [(z, x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
 
-def main(grib="data/hrrr_t2m.grib2", out="web/tiles"):
+def build(source, out, minzoom=MINZOOM, maxzoom=MAXZOOM, workers=None, log=True):
+    """Build zooms minzoom..maxzoom from a GRIB2 file or a published grid into
+    pack files in `out`.  Returns (tiles, packs, bytes, seconds)."""
     t0 = time.time()
-    fld = Field(grib)
-    jobs = [t for z in range(MINZOOM, MAXZOOM + 1) for t in domain_tiles(fld, z)]
+    fld = Field(source)
+    jobs = [t for z in range(minzoom, maxzoom + 1) for t in domain_tiles(fld, z)]
     # Longest jobs first (low zooms are the heaviest tiles) so no straggler is
     # left running alone at the end.
     jobs.sort(key=lambda t: t[0])
     packs = {}
     nbytes = 0
-    with Pool(os.cpu_count(), initializer=init_worker, initargs=(grib,)) as pool:
-        for n, (zxy, data) in enumerate(pool.imap_unordered(build_tile, jobs, chunksize=4)):
+    with Pool(workers or os.cpu_count(), initializer=init_worker, initargs=(source,)) as pool:
+        for n, (zxy, data) in enumerate(pool.imap_unordered(build_tile, jobs, chunksize=2)):
             if data:
                 packs.setdefault(pack_key(*zxy), []).append((zxy, data))
                 nbytes += len(data)
-            if n % 500 == 0:
+            if log and n % 500 == 0:
                 print(f"{n}/{len(jobs)} tiles, {nbytes/1e6:.1f} MB, {time.time()-t0:.0f}s", flush=True)
     os.makedirs(out, exist_ok=True)
     for f in os.listdir(out):
@@ -501,6 +541,11 @@ def main(grib="data/hrrr_t2m.grib2", out="web/tiles"):
             body += data
         with open(os.path.join(out, "%d-%d-%d.bin" % key), "wb") as f:
             f.write(header + body)
+    return fld, packs, nbytes, time.time() - t0
+
+
+def main(grib="data/hrrr_t2m.grib2", out="web/tiles"):
+    fld, packs, nbytes, secs = build(grib, out)
     meta = json.load(open(grib.replace(".grib2", ".json")))
     meta.update(
         minzoom=MINZOOM, maxzoom=MAXZOOM, units="F",
@@ -509,7 +554,7 @@ def main(grib="data/hrrr_t2m.grib2", out="web/tiles"):
     )
     json.dump(meta, open(os.path.join(out, "meta.json"), "w"))
     ntiles = sum(len(v) for v in packs.values())
-    print(f"done: {ntiles} tiles in {len(packs)} packs, {nbytes/1e6:.1f} MB, {time.time()-t0:.0f}s")
+    print(f"done: {ntiles} tiles in {len(packs)} packs, {nbytes/1e6:.1f} MB, {secs:.0f}s")
 
 
 if __name__ == "__main__":
