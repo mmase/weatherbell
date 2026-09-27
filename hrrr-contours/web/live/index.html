@@ -566,6 +566,9 @@ function viewInsideData() {
 if (!meta.global) {
   let good = null, fixing = false;
   const state = () => ({ center: map.getCenter(), zoom: map.getZoom() });
+  // domain centre (grid middle) as a fallback anchor
+  const CENTER = (() => { const [mx, my] = grid.nodeMerc((NX - 1) / 2, (NY - 1) / 2);
+    return { lng: mx * 360 - 180, lat: Math.atan(Math.sinh(Math.PI * (1 - 2 * my))) * 180 / Math.PI }; })();
   const lerp = (a, b, t) => ({ center: [a.center.lng + (b.center.lng - a.center.lng) * t, a.center.lat + (b.center.lat - a.center.lat) * t],
                                zoom: a.zoom + (b.zoom - a.zoom) * t });
   // start inside: zoom in from the initial view until it fits
@@ -574,16 +577,25 @@ if (!meta.global) {
   map.on("move", () => {
     if (fixing) return;
     if (viewInsideData()) { good = state(); return; }
-    // went past the data: step back to the furthest valid point along this move
+    // went past the data: pick the valid view closest to where the user was
+    // heading, searching back along the move and in toward the domain centre
     fixing = true;
     const target = state();
-    let lo = 0, hi = 1;
-    for (let k = 0; k < 10; k++) {
-      const mid = (lo + hi) / 2;
-      map.jumpTo(lerp(good, target, mid));
-      if (viewInsideData()) lo = mid; else hi = mid;
-    }
-    map.jumpTo(lerp(good, target, lo));
+    const mid = { center: CENTER, zoom: target.zoom };
+    const search = (from) => {
+      let lo = 0, hi = 1; // t = how far from `from` toward target
+      for (let k = 0; k < 12; k++) {
+        const t = (lo + hi) / 2;
+        map.jumpTo(lerp(from, target, t));
+        if (viewInsideData()) lo = t; else hi = t;
+      }
+      map.jumpTo(lerp(from, target, lo));
+      return viewInsideData() ? state() : null;
+    };
+    const dist = (a) => { const p = map.project(target.center), q = map.project(a.center); return Math.hypot(p.x - q.x, p.y - q.y); };
+    const options = [search(good), search(mid)].filter(Boolean);
+    const best = options.sort((a, b) => dist(a) - dist(b))[0] || good;
+    map.jumpTo(best);
     good = state();
     fixing = false;
   });
