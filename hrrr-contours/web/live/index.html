@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>HRRR Live Isotherms</title>
+<title>HRRR Live Forecast</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,400..700&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -132,23 +132,24 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
 </style>
 </head>
 <body>
-<div id="map" role="application" aria-label="Map of HRRR 2 metre temperature forecast with 1 degree bands"></div>
+<div id="map" role="application" aria-label="Map of an HRRR forecast field drawn as vector bands"></div>
 
 <section id="info" class="panel" aria-live="polite">
   <div>
     <div class="eyebrow">HRRR · CONUS 3 km · Forecast</div>
-    <h1>2 m Air Temperature</h1>
+    <h1 id="title">Loading…</h1>
     <div class="run" id="run">Loading…</div>
   </div>
   <div class="readout">
-    <div id="val">––<small>°F</small></div>
+    <div id="val">––</div>
     <div id="sub">Hover or tap<br>the map</div>
   </div>
+  <div class="toggles" id="fields" role="group" aria-label="Field"></div>
   <div class="toggles">
     <button class="chip" id="t-labels" aria-pressed="true">Labels</button>
     <button class="chip" id="t-borders" aria-pressed="true">Borders</button>
   </div>
-  <div class="credit">Vector bands every 1&nbsp;°F. Zoomed out: tiles built when the run is published. Zoomed in and during playback: contoured on this device from the model grid. Data: NOAA/NCEP HRRR via <a href="https://registry.opendata.aws/noaa-hrrr-pds/" target="_blank" rel="noopener">AWS Open Data</a>. Boundaries: Natural Earth, US Census.</div>
+  <div class="credit"><span id="credit-bands"></span> Zoomed out: tiles built when the run is published. Zoomed in and during playback: contoured on this device from the model grid. Data: NOAA/NCEP HRRR via <a href="https://registry.opendata.aws/noaa-hrrr-pds/" target="_blank" rel="noopener">AWS Open Data</a>. Boundaries: Natural Earth, US Census.</div>
 </section>
 
 <div id="zoom"><button id="zin" aria-label="Zoom in">+</button><button id="zout" aria-label="Zoom out">−</button></div>
@@ -161,7 +162,7 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
     <input id="hour" type="range" min="0" max="12" step="1" value="0" aria-label="Forecast hour">
     <div id="valid">––<small>––</small></div>
   </div>
-  <div class="head"><span class="eyebrow">Temperature °F · 1° bands</span><span class="eyebrow" id="range"></span></div>
+  <div class="head"><span class="eyebrow" id="legend-title"></span><span class="eyebrow" id="range"></span></div>
   <div id="bar"><canvas id="barc" width="600" height="1"></canvas><div id="cursor"></div></div>
   <div id="ticks"></div>
 </section>
@@ -172,11 +173,13 @@ import { Grid, sample } from "./contour.js";
 
 // ------------------------------------------------------------------ colours
 // One palette shared by the tile layers and the WebGL layer (CIELAB blend).
-const STOPS = [
-  [-40, "#f1e6f5"], [-20, "#c7a4d8"], [0, "#7b4fa6"], [10, "#4b3f9e"], [20, "#2c5aa8"],
-  [32, "#3d93d1"], [40, "#72c6cf"], [50, "#58b37a"], [60, "#9ccb52"], [70, "#eadb55"],
-  [80, "#f5a940"], [90, "#e66a31"], [100, "#c42a2c"], [110, "#8e1239"], [120, "#e6a3c3"],
-];
+// field: #t2m / #pwat, else the first one published
+const RUNS = await (await fetch("run/index.json")).json();
+const VAR_ID = RUNS.vars.some((v) => v.id === location.hash.slice(1)) ? location.hash.slice(1) : RUNS.vars[0].id;
+const BASE = `run/${VAR_ID}/`;
+const meta = await (await fetch(`${BASE}meta.json`)).json();
+const VAR = meta.var, STEP = VAR.interval, DEC = VAR.decimals;
+const STOPS = VAR.stops; // display units -> colour
 const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
 const lin = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
 const gam = (c) => 255 * (c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055);
@@ -205,12 +208,14 @@ function colorAt(v) {
   }
   return fromLab(LABS[LABS.length - 1][1]);
 }
-const BAND0 = -60; // palette texel 0 = band -60 degF
-const bandRGB = (t) => colorAt(t + 0.5);
+// Contours work in band units (value / interval): band b covers [b, b+1) * interval.
+const BAND0 = Math.floor(meta.tmin) - 64; // palette texel 0
+const bandRGB = (b) => colorAt((b + 0.5) * STEP);
+const fmtV = (v, extra = 0) => v.toFixed(DEC + extra);
+const UNIT = VAR.units, isTemp = VAR.id === "t2m";
 const rgbStr = ([r, g, b]) => `rgb(${r},${g},${b})`;
 
 // ------------------------------------------------------------------ data
-const meta = await (await fetch("run/meta.json")).json();
 const b64 = meta.encoding === "base64";
 async function fetchBin(path) {
   const r = await fetch(b64 ? path.replace(/\.\w+$/, ".txt").replace(/\.i16\.txt$/, ".txt") : path);
@@ -228,7 +233,7 @@ const hh = (h) => String(h).padStart(2, "0");
 const fieldCache = new Map(); // hour -> Promise<Int16Array> (decoded: degF * scale)
 function field(h) {
   if (!fieldCache.has(h)) {
-    fieldCache.set(h, fetchBin(`run/grids/f${hh(h)}.i16.gz`).then(inflate).then((buf) => {
+    fieldCache.set(h, fetchBin(`${BASE}grids/f${hh(h)}.i16.gz`).then(inflate).then((buf) => {
       const d = new Int16Array(buf);
       for (let r = 0; r < NY; r++) for (let c = 1, o = r * NX; c < NX; c++) d[o + c] += d[o + c - 1]; // undo row deltas
       return d;
@@ -432,12 +437,13 @@ const DOMAIN = (() => {
 
 // ------------------------------------------------------------------ server tiles (zoomed out)
 const packs = new Map(), packBytes = new Map(), PACK_BUDGET = 48e6; let packCached = 0;
-const packKey = (z, x, y) => (z <= 4 ? `${z}-0-0` : `5-${x >> (z - 5)}-${y >> (z - 5)}`);
+// z2-z4: one pack per zoom; z5-z6: one pack per z4 ancestor (mirrors live_pack_key)
+const packKey = (z, x, y) => (z <= 4 ? `${z}-0-0` : `4-${x >> (z - 4)}-${y >> (z - 4)}`);
 function getPack(h, key) {
   const id = `${h}/${key}`;
   let p = packs.get(id);
   if (p) { packs.delete(id); packs.set(id, p); return p; }
-  p = fetchBin(`run/tiles/f${hh(h)}/${key}.bin`).then((buf) => {
+  p = fetchBin(`${BASE}tiles/f${hh(h)}/${key}.bin`).then((buf) => {
     const dv = new DataView(buf), n = dv.getUint32(0, true), index = new Map();
     for (let i = 0, o = 4; i < n; i++, o += 20)
       index.set(`${dv.getUint32(o, true)}/${dv.getUint32(o + 4, true)}/${dv.getUint32(o + 8, true)}`, [dv.getUint32(o + 12, true), dv.getUint32(o + 16, true)]);
@@ -475,7 +481,7 @@ const labelLayer = (id, minzoom, maxzoom, filter) => ({
   id, type: "symbol", source: "t2m", "source-layer": "labels", minzoom, maxzoom: Math.min(maxzoom, tileLayerMax), filter,
   layout: {
     "symbol-placement": "line", "symbol-spacing": ["interpolate", ["linear"], ["zoom"], 3, 220, 10, 420],
-    "text-field": ["concat", ["to-string", ["get", "t"]], "°"], "text-font": ["DejaVu Sans Bold"],
+    "text-field": ["concat", ["number-format", ["*", ["get", "t"], STEP], { "min-fraction-digits": DEC, "max-fraction-digits": DEC }], isTemp ? "°" : "″"], "text-font": ["DejaVu Sans Bold"],
     "text-size": ["interpolate", ["linear"], ["zoom"], 3, 10, 10, 12.5], "text-max-angle": 40,
     "text-keep-upright": true, "text-rotation-alignment": "map", "text-padding": 4,
   },
@@ -576,17 +582,34 @@ playBtn.addEventListener("click", () => {
 showValid(hour);
 
 // ------------------------------------------------------------------ legend + readout
-document.getElementById("range").textContent = `${Math.floor(meta.tmin)}° to ${Math.ceil(meta.tmax)}° this run`;
-const lgLo = Math.floor(meta.tmin / 10) * 10, lgHi = Math.ceil(meta.tmax / 10) * 10;
+document.getElementById("title").textContent = VAR.name;
+document.title = `HRRR ${VAR.short}`;
+document.getElementById("legend-title").textContent = `${VAR.short} ${UNIT} · ${fmtV(STEP)}${isTemp ? "°" : " " + UNIT} bands`;
+document.getElementById("credit-bands").textContent = `Vector bands every ${fmtV(STEP)} ${UNIT}.`;
+document.getElementById("range").textContent = `${fmtV(meta.vmin)} to ${fmtV(meta.vmax)} ${UNIT} this run`;
+// legend in band units; ticks every VAR.ticks display units
+const TICK = Math.round(VAR.ticks / STEP);
+const lgLo = Math.floor(meta.tmin / TICK) * TICK, lgHi = Math.ceil(meta.tmax / TICK) * TICK;
 const bc = document.getElementById("barc"), bctx = bc.getContext("2d");
 bc.width = lgHi - lgLo; bc.style.imageRendering = "pixelated";
-for (let t = lgLo; t < lgHi; t++) { bctx.fillStyle = rgbStr(bandRGB(t)); bctx.fillRect(t - lgLo, 0, 1, 1); }
+for (let b = lgLo; b < lgHi; b++) { bctx.fillStyle = rgbStr(bandRGB(b)); bctx.fillRect(b - lgLo, 0, 1, 1); }
 const ticks = document.getElementById("ticks");
-const pos = (t) => `${((t - lgLo) / (lgHi - lgLo)) * 100}%`;
-for (let t = lgLo; t <= lgHi; t += 10) { const s = document.createElement("span"); s.style.left = pos(t); s.textContent = t; ticks.append(s); }
-if (32 > lgLo && 32 < lgHi) {
-  const s = document.createElement("span"); s.className = "frz"; s.style.left = pos(32); s.textContent = "32"; ticks.append(s);
-  [...ticks.children].forEach((e) => { if (e.textContent === "30" && !e.className) e.style.visibility = "hidden"; });
+const pos = (b) => `${((b - lgLo) / (lgHi - lgLo)) * 100}%`;
+const hl = VAR.highlight == null ? null : VAR.highlight / STEP;
+for (let b = lgLo; b <= lgHi; b += TICK) {
+  const s = document.createElement("span"); s.style.left = pos(b); s.textContent = +(b * STEP).toFixed(DEC); ticks.append(s);
+  if (hl != null && Math.abs(b - hl) < TICK / 2) s.style.visibility = "hidden"; // make room for the highlight tick
+}
+if (hl != null && hl > lgLo && hl < lgHi) {
+  const s = document.createElement("span"); s.className = "frz"; s.style.left = pos(hl); s.textContent = VAR.highlight; ticks.append(s);
+}
+// field switcher
+const fieldsEl = document.getElementById("fields");
+for (const v of RUNS.vars) {
+  const b = document.createElement("button");
+  b.className = "chip"; b.textContent = v.name; b.setAttribute("aria-pressed", v.id === VAR_ID);
+  b.onclick = () => { if (v.id !== VAR_ID) { location.hash = v.id; location.reload(); } };
+  fieldsEl.append(b);
 }
 const val = document.getElementById("val"), sub = document.getElementById("sub"), cur = document.getElementById("cursor");
 let lastPt = null, pendingRO = null;
@@ -594,10 +617,11 @@ async function readout(point, lngLat) {
   lastPt = { point, lngLat };
   const f = frame, A = await field(f.hA), B = f.hB == null ? null : await field(f.hB);
   const t = sample(grid, B ? [A, B] : [A], f.w, lngLat.lng, lngLat.lat);
-  if (t == null) { val.innerHTML = "––<small>°F</small>"; sub.innerHTML = "Outside the<br>HRRR domain"; cur.style.display = "none"; return; }
-  const c = ((t - 32) * 5 / 9).toFixed(1);
-  val.innerHTML = `${t.toFixed(1)}<small>°F</small>`;
-  sub.innerHTML = `${c} °C · band ${Math.floor(t)}–${Math.floor(t) + 1}°<br>${Math.abs(lngLat.lat).toFixed(2)}°${lngLat.lat >= 0 ? "N" : "S"} ${Math.abs(lngLat.lng).toFixed(2)}°${lngLat.lng >= 0 ? "E" : "W"}`;
+  if (t == null) { val.innerHTML = "––"; sub.innerHTML = "Outside the<br>HRRR domain"; cur.style.display = "none"; return; }
+  const v = t * STEP, b = Math.floor(t);
+  const alt = isTemp ? `${((v - 32) * 5 / 9).toFixed(1)} °C` : `${(v * 25.4).toFixed(1)} mm`;
+  val.innerHTML = `${fmtV(v, 1)}<small>${UNIT}</small>`;
+  sub.innerHTML = `${alt} · band ${fmtV(b * STEP)}–${fmtV((b + 1) * STEP)}<br>${Math.abs(lngLat.lat).toFixed(2)}°${lngLat.lat >= 0 ? "N" : "S"} ${Math.abs(lngLat.lng).toFixed(2)}°${lngLat.lng >= 0 ? "E" : "W"}`;
   cur.style.display = "block"; cur.style.left = pos(t);
 }
 map.on("mousemove", (e) => { if (pendingRO) return; pendingRO = requestAnimationFrame(() => { pendingRO = null; readout(e.point, e.lngLat); }); });

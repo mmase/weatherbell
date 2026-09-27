@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Generate a MapLibre SDF glyph range (0-255.pbf) for contour labels.
+"""Generate MapLibre SDF glyph ranges for contour labels.
 
-Only the handful of characters labels need (digits, minus, degree sign, F) are
-rendered, from DejaVu Sans Bold, so the page needs no external glyph server.
+Only the handful of characters labels need (digits, minus, decimal point,
+degree and inch marks, F) are rendered, from DejaVu Sans Bold, so the page
+needs no external glyph server.  One .pbf is written per 256-codepoint range.
 """
 import os
 import sys
@@ -13,7 +14,7 @@ from scipy.ndimage import distance_transform_edt
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 STACK = "DejaVu Sans Bold"
-CHARS = " 0123456789-°F"
+CHARS = " 0123456789-.°F\u2033"  # \u2033 = double prime (inches)
 SIZE, BORDER, RADIUS, CUTOFF, SS = 24, 3, 8, 0.25, 16
 
 
@@ -58,12 +59,15 @@ def glyph(font, ch):
 
 def main(out="web/glyphs"):
     font = ImageFont.truetype(FONT, SIZE * SS)
-    stack = fld(1, 2, STACK.encode()) + fld(2, 2, b"0-255")
-    for ch in CHARS:
-        stack += fld(3, 2, glyph(font, ch))
     os.makedirs(f"{out}/{STACK}", exist_ok=True)
-    with open(f"{out}/{STACK}/0-255.pbf", "wb") as f:
-        f.write(fld(1, 2, stack))
+    for base in sorted({ord(c) // 256 * 256 for c in CHARS}):
+        rng = f"{base}-{base + 255}"
+        stack = fld(1, 2, STACK.encode()) + fld(2, 2, rng.encode())
+        for ch in CHARS:
+            if base <= ord(ch) <= base + 255:
+                stack += fld(3, 2, glyph(font, ch))
+        with open(f"{out}/{STACK}/{rng}.pbf", "wb") as f:
+            f.write(fld(1, 2, stack))
 
 
 if __name__ == "__main__":

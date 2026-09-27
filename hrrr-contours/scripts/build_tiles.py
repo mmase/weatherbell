@@ -499,6 +499,12 @@ def pack_key(z, x, y):
     return (root, x >> (z - root), y >> (z - root))
 
 
+def live_pack_key(z, x, y):
+    """Packing for the live map's z2-z6 tiles: one pack per zoom up to z4, then one
+    per z4 ancestor (few files per forecast hour)."""
+    return (z, 0, 0) if z <= 4 else (4, x >> (z - 4), y >> (z - 4))
+
+
 def domain_tiles(fld, z):
     ii = np.concatenate([np.arange(fld.nx), np.full(fld.ny, fld.nx - 1), np.arange(fld.nx)[::-1], np.zeros(fld.ny)])
     jj = np.concatenate([np.zeros(fld.nx), np.arange(fld.ny), np.full(fld.nx, fld.ny - 1), np.arange(fld.ny)[::-1]])
@@ -509,7 +515,7 @@ def domain_tiles(fld, z):
     return [(z, x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
 
-def build(source, out, minzoom=MINZOOM, maxzoom=MAXZOOM, workers=None, log=True):
+def build(source, out, minzoom=MINZOOM, maxzoom=MAXZOOM, workers=None, log=True, pack=None):
     """Build zooms minzoom..maxzoom from a GRIB2 file or a published grid into
     pack files in `out`.  Returns (tiles, packs, bytes, seconds)."""
     t0 = time.time()
@@ -523,7 +529,7 @@ def build(source, out, minzoom=MINZOOM, maxzoom=MAXZOOM, workers=None, log=True)
     with Pool(workers or os.cpu_count(), initializer=init_worker, initargs=(source,)) as pool:
         for n, (zxy, data) in enumerate(pool.imap_unordered(build_tile, jobs, chunksize=2)):
             if data:
-                packs.setdefault(pack_key(*zxy), []).append((zxy, data))
+                packs.setdefault((pack or pack_key)(*zxy), []).append((zxy, data))
                 nbytes += len(data)
             if log and n % 500 == 0:
                 print(f"{n}/{len(jobs)} tiles, {nbytes/1e6:.1f} MB, {time.time()-t0:.0f}s", flush=True)
