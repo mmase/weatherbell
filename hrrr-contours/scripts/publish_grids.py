@@ -189,7 +189,8 @@ def main():
     idx_path = os.path.join(a.out, "index.json")
     index = json.load(open(idx_path)) if os.path.exists(idx_path) else {"vars": []}
     index["vars"] = [v for v in index["vars"] if v["id"] != a.var] + [{"id": a.var, "name": var["short"]}]
-    index["vars"].sort(key=lambda v: list(VARIABLES).index(v["id"]))
+    order = list(VARIABLES)  # other publishers (GFS) append their own fields after these
+    index["vars"].sort(key=lambda v: order.index(v["id"]) if v["id"] in order else len(order))
     with open(idx_path, "w") as fp:
         json.dump(index, fp)
     print(f"published in {time.time() - t0:.1f}s wall")

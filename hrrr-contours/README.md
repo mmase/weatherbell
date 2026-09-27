@@ -133,5 +133,24 @@ Measured in this repo's container (Node / headless Chromium, 4 vCPU):
 | Worker time per tile, z12 / z8 / z4 during playback | 11 / 31 / 58 ms |
 | GPU data per tile at z9 / z12 | ~5 / ~3 MB |
 
+**Global models (GFS)** are published on the 0.25° lat/lon grid cropped to ±85.25°
+(one row past web mercator), with the −180° column repeated at +180° so the field
+closes at the date line:
+
+```
+python3 scripts/publish_gfs_t2m.py --run 2026092706 --hours 72 --step 6   # 2 m temperature
+python3 scripts/publish_gfs_snow.py --run 2026022200 --hours 72            # 10:1 snowfall
+```
+
+GFS temperature takes ~4 s for 13 grids (6 MB) and ~3 s per hour for z0–z2 tiles; the
+device contours from z3. The page shows global models on a globe that flattens to
+Mercator as you zoom in and wraps east–west. Around the globe is space: a star field on
+a celestial sphere fixed to the Earth (~6,000 stars with a steep brightness power law
+and spectral tints, plus the Milky Way along the real galactic plane, brightest toward
+Sagittarius), drawn in a 2D canvas under the transparent map canvas and redrawn only
+when the view moves. MapLibre's atmosphere adds the blue limb. The polar caps above the
+data (85.25° to 90°) are filled by the WebGL layer with the nearest data row, smoothed
+progressively toward the pole, using MapLibre's pole vertices (y = −32768 / 40960).
+
 Not done yet: contour labels above z6, real-device GPU frame-rate measurements (the
 container only has a software rasteriser), and tuning for low-memory phones.

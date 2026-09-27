@@ -8,15 +8,18 @@ const land = load("world-atlas/land-50m.json");
 const us = load("us-atlas/states-10m.json");
 
 // Split lines where they jump across the antimeridian (+179.9 -> -179.9);
-// otherwise the jump is drawn as a line across the whole world.
+// otherwise the jump is drawn as a line across the whole world.  Also drop the
+// artificial edge Antarctica's outline runs along at -90 (web mercator clamps
+// it to 85 S, where it would show as a ring around the pole on the globe).
 function splitDateline(geometry) {
   if (geometry.type !== "MultiLineString" && geometry.type !== "LineString") return geometry;
   const lines = geometry.type === "LineString" ? [geometry.coordinates] : geometry.coordinates;
   const out = [];
   for (const line of lines) {
-    let cur = [line[0]];
-    for (let i = 1; i < line.length; i++) {
-      if (Math.abs(line[i][0] - line[i - 1][0]) > 180) { if (cur.length > 1) out.push(cur); cur = []; }
+    let cur = [];
+    for (let i = 0; i < line.length; i++) {
+      if (Math.abs(line[i][1]) > 85) { if (cur.length > 1) out.push(cur); cur = []; continue; }
+      if (i && Math.abs(line[i][0] - line[i - 1][0]) > 180) { if (cur.length > 1) out.push(cur); cur = []; }
       cur.push(line[i]);
     }
     if (cur.length > 1) out.push(cur);

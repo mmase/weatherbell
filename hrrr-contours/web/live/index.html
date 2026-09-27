@@ -56,6 +56,10 @@
 html, body { height: 100%; margin: 0; }
 body { background: var(--water); color: var(--ink); font: 14px/1.4 var(--ui); overflow: hidden; }
 #map { position: absolute; inset: 0; }
+/* global models: the globe floats in space (the map canvas is transparent around it) */
+body.space { background: #000; }
+#sky { position: absolute; inset: 0; width: 100%; height: 100%; display: none; }
+body.space #sky { display: block; }
 
 /* the few MapLibre rules the page needs (its stylesheet is not loaded) */
 .maplibregl-map { overflow: hidden; position: relative; -webkit-tap-highlight-color: transparent; }
@@ -132,6 +136,7 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
 </style>
 </head>
 <body>
+<canvas id="sky" aria-hidden="true"></canvas>
 <div id="map" role="application" aria-label="Map of an HRRR forecast field drawn as vector bands"></div>
 
 <section id="info" class="panel" aria-live="polite">
@@ -245,11 +250,14 @@ const inflate = async (buf) => new Response(new Blob([buf]).stream().pipeThrough
 const HOURS = meta.hours, NX = meta.nx, NY = meta.ny;
 const hh = (h) => String(h).padStart(2, "0");
 const fieldCache = new Map(); // hour -> Promise<Int16Array> (decoded: degF * scale)
+const fieldReady = new Map(); // hour -> Int16Array, once loaded
+const POLAR_CAPS = !!meta.global && meta.proj.type === "latlon";
 function field(h) {
   if (!fieldCache.has(h)) {
     fieldCache.set(h, fetchBin(`${BASE}grids/f${hh(h)}.i16.gz`).then(inflate).then((buf) => {
       const d = new Int16Array(buf);
       for (let r = 0; r < NY; r++) for (let c = 1, o = r * NX; c < NX; c++) d[o + c] += d[o + c - 1]; // undo row deltas
+      fieldReady.set(h, d);
       return d;
     }));
   }
@@ -301,12 +309,14 @@ const frameKey = (f) => `${f.hA}|${f.hB}|${f.w.toFixed(3)}|${f.px}`;
 // so tiles project correctly on flat Mercator, on the globe, and in between.
 // a_pos is tile-local (uint16 -> 0..1 maps to -0.25..1.75 tiles); projectTile()
 // takes tile units 0..8192 with per-tile uniforms from getProjectionData().
+// Polar caps (u_cap) pass raw tile units: y = -32768 / 40960 is MapLibre's
+// north / south pole, so the globe has no hole above web mercator's 85°.
 const makeVS = (sd) => `#version 300 es
 ${sd.vertexShaderPrelude}
 ${sd.define}
-in vec2 a_pos; in int a_band;
+in vec2 a_pos; in int a_band; uniform float u_cap;
 flat out int v_band;
-void main() { gl_Position = projectTile((a_pos * 2.0 - 0.25) * 8192.0); v_band = a_band; }`;
+void main() { vec2 p = u_cap > 0.5 ? a_pos : (a_pos * 2.0 - 0.25) * 8192.0; gl_Position = projectTile(p, p); v_band = a_band; }`;
 const FS = `#version 300 es
 precision highp float;
 flat in int v_band; uniform sampler2D u_pal; out vec4 color;
@@ -354,7 +364,8 @@ const live = {
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
     const u = (n) => gl.getUniformLocation(p, n);
     const prog = { p, pal: u("u_pal"), matrix: u("u_projection_matrix"), coords: u("u_projection_tile_mercator_coords"),
-                   clip: u("u_projection_clipping_plane"), transition: u("u_projection_transition"), fallback: u("u_projection_fallback_matrix") };
+                   clip: u("u_projection_clipping_plane"), transition: u("u_projection_transition"), fallback: u("u_projection_fallback_matrix"),
+                   cap: u("u_cap") };
     this.programs.set(sd.variantName, prog);
     return prog;
   },
@@ -400,7 +411,90 @@ const live = {
     }
   },
   active() { return playing || this.map.getZoom() >= CLIENT_MIN; },
+  // project one tile's geometry: per-tile uniforms from MapLibre (float32 tile
+  // matrix / globe uniforms); wrap = which world copy the tile is drawn in
+  setTile(prog, z, x, y, wrap) {
+    const gl = this.gl, pd = this.map.transform.getProjectionData({
+      overscaledTileID: { canonical: { x, y, z }, wrap, overscaledZ: z, key: `live/${wrap}/${z}/${x}/${y}` },
+      applyGlobeMatrix: true,
+    });
+    gl.uniformMatrix4fv(prog.matrix, false, pd.mainMatrix);
+    gl.uniformMatrix4fv(prog.fallback, false, pd.fallbackMatrix);
+    gl.uniform4f(prog.coords, ...pd.tileMercatorCoords);
+    gl.uniform4f(prog.clip, ...pd.clippingPlane);
+    gl.uniform1f(prog.transition, pd.projectionTransition);
+  },
+  useProgram(gl, opts) {
+    const prog = this.program(opts.shaderData);
+    gl.useProgram(prog.p);
+    gl.disable(gl.DEPTH_TEST); gl.disable(gl.STENCIL_TEST); gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex); gl.uniform1i(prog.pal, 0);
+    return prog;
+  },
+  // global lat/lon grids stop at 85.25°: fill each polar cap with the band of the
+  // nearest data row, column by column, for the frame being shown
+  drawCaps(gl, opts) {
+    if (!POLAR_CAPS || this.map.getZoom() > 7) return;
+    const f = playing ? frame : { ...frame, hB: null, w: 0 };
+    const A = fieldReady.get(f.hA), B = f.hB == null ? null : fieldReady.get(f.hB);
+    if (!A || (f.hB != null && !B)) { field(f.hA).then(() => this.map.triggerRepaint()); if (f.hB != null) field(f.hB).then(() => this.map.triggerRepaint()); return; }
+    // with device tiles drawn on top, the cap may run under them (a coarse
+    // playback lattice can stop short of the last row); under MapLibre's own
+    // tile layers it must stop exactly at their edge (85.05°)
+    const under = this.active();
+    const key = `${f.hA}|${f.hB}|${f.w.toFixed(3)}|${under}`;
+    if (this.capKey !== key) {
+      const N = NX - 1, row = (r) => { const o = new Float64Array(N);
+        for (let k = 0; k < N; k++) { const c = r * NX + k; o[k] = (B ? A[c] * (1 - f.w) + B[c] * f.w : A[c]) / meta.scale; } return o; };
+      const smooth = (v, h) => { // circular moving mean over 2h+1 columns (h = Infinity: row mean)
+        if (!h) return v;
+        const mean = v.reduce((a, b) => a + b, 0) / N;
+        if (h >= N / 2) return v.map(() => mean);
+        const o = new Float64Array(N); let acc = 0;
+        for (let k = -h; k <= h; k++) acc += v[(k + N) % N];
+        for (let k = 0; k < N; k++) { o[k] = acc / (2 * h + 1); acc += v[(k + h + 1) % N] - v[(k - h + N) % N]; }
+        return o; };
+      const mercY = (lat) => (1 - Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360)) / Math.PI) / 2 * 8192;
+      // rings from the data edge to the pole, smoothed more toward the pole so the
+      // columns don't converge into a pinwheel: [from lat, to lat, half-width in columns]
+      const edge = under ? 83 : 85.0511;
+      const RINGS = [[edge, 86, 0], [86, 87, 3], [87, 88, 10], [88, 88.8, 30], [88.8, 89.5, 90], [89.5, 90, Infinity]];
+      const segs = N * 2 * RINGS.length;
+      const pos = new Float32Array(segs * 8), band = new Int16Array(segs * 4), index = new Uint32Array(segs * 6);
+      let v = 0, q = 0;
+      for (const [r, sgn] of [[NY - 1, 1], [0, -1]]) {
+        const base = row(r);
+        for (const [la0, la1, h] of RINGS) {
+          const vals = smooth(base, h);
+          const y0 = mercY(sgn * la0), y1 = la1 === 90 ? (sgn > 0 ? -32768 : 40960) : mercY(sgn * la1);
+          for (let k = 0; k < N; k++) {
+            const b = Math.floor(vals[k] + 1e-4), xa = (meta.x0 + meta.dx * (k - 0.5) + 180) / 360 * 8192, xb = xa + meta.dx / 360 * 8192;
+            pos.set([xa, y1, xb, y1, xa, y0, xb, y0], v * 2);
+            band.fill(b, v, v + 4);
+            index.set([v, v + 1, v + 3, v, v + 2, v + 3], q); // provoking vertex (last) carries the band
+            v += 4; q += 6;
+          }
+        }
+      }
+      if (!this.capVao) { this.capVao = gl.createVertexArray(); this.capBufs = [gl.createBuffer(), gl.createBuffer(), gl.createBuffer()]; }
+      gl.bindVertexArray(this.capVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.capBufs[0]); gl.bufferData(gl.ARRAY_BUFFER, pos, gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.capBufs[1]); gl.bufferData(gl.ARRAY_BUFFER, band, gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(1); gl.vertexAttribIPointer(1, 1, gl.SHORT, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.capBufs[2]); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, index, gl.DYNAMIC_DRAW);
+      this.capKey = key; this.capCount = index.length;
+    }
+    const prog = this.useProgram(gl, opts);
+    gl.uniform1f(prog.cap, 1);
+    this.setTile(prog, 0, 0, 0, 0);
+    gl.bindVertexArray(this.capVao);
+    gl.drawElements(gl.TRIANGLES, this.capCount, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+    gl.uniform1f(prog.cap, 0);
+  },
   render(gl, opts) {
+    this.drawCaps(gl, opts);
     if (!this.active()) return;
     const map = this.map, f = frame;
     const want = visibleTiles(map, f);
@@ -428,27 +522,13 @@ const live = {
       const seen = new Set(shown.map((d) => `${d.key}@${d.xw}`));
       draw = shown.concat(want.filter((t) => cache.has(t.key) && !seen.has(`${t.key}@${t.xw}`)).map((t) => ({ key: t.key, xw: t.xw })));
     }
-    const prog = this.program(opts.shaderData);
-    gl.useProgram(prog.p);
-    gl.disable(gl.DEPTH_TEST); gl.disable(gl.STENCIL_TEST); gl.disable(gl.CULL_FACE); gl.disable(gl.BLEND);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex); gl.uniform1i(prog.pal, 0);
+    const prog = this.useProgram(gl, opts);
     const now = performance.now(), n = (z) => 2 ** z;
     for (const { key, xw } of draw) {
       const t = cache.get(key);
       if (!t || !t.count) continue;
       t.used = now;
-      // exact per-tile projection (float32 tile matrix / globe uniforms) from MapLibre;
-      // wrap = which world copy this tile is drawn in
-      const wrap = Math.floor(xw / n(t.z));
-      const pd = map.transform.getProjectionData({
-        overscaledTileID: { canonical: { x: t.x, y: t.y, z: t.z }, wrap, overscaledZ: t.z, key: `live/${wrap}/${t.z}/${t.x}/${t.y}` },
-        applyGlobeMatrix: true,
-      });
-      gl.uniformMatrix4fv(prog.matrix, false, pd.mainMatrix);
-      gl.uniformMatrix4fv(prog.fallback, false, pd.fallbackMatrix);
-      gl.uniform4f(prog.coords, ...pd.tileMercatorCoords);
-      gl.uniform4f(prog.clip, ...pd.clippingPlane);
-      gl.uniform1f(prog.transition, pd.projectionTransition);
+      this.setTile(prog, t.z, t.x, t.y, Math.floor(xw / n(t.z)));
       gl.bindVertexArray(t.vao);
       gl.drawElements(gl.TRIANGLES, t.count, gl.UNSIGNED_INT, 0);
     }
@@ -540,7 +620,9 @@ const map = new maplibregl.Map({
   style: {
     version: 8,
     // global models: a globe when zoomed out, blending to Mercator as you zoom in (like Google Maps)
-    ...(meta.global ? { projection: { type: "globe" } } : {}),
+    ...(meta.global ? { projection: { type: "globe" },
+      // thin blue atmosphere at the limb when zoomed out, gone once the map is flat
+      sky: { "atmosphere-blend": ["interpolate", ["linear"], ["zoom"], 0, 1, 4, 0.8, 6, 0] } } : {}),
     glyphs: "hrrrglyph://{fontstack}/{range}",
     sources: {
       t2m: { type: "vector", tiles: [`hrrr://${hour}/{z}/{x}/{y}`], minzoom: meta.tiles?.minzoom ?? 2, maxzoom: meta.tiles ? meta.tiles.maxzoom : 2 },
@@ -624,6 +706,103 @@ if (!meta.global) {
   map.on("resize", () => { for (let k = 0; k < 60 && !viewInsideData(); k++) map.jumpTo({ zoom: map.getZoom() + 0.1 }); good = state(); });
 }
 window.map = map;
+
+// ------------------------------------------------------------------ space
+// Global models zoom out to a globe; behind it is a star field on a celestial
+// sphere fixed to the Earth (as in Google Earth), so stars turn with the globe.
+// Stars are drawn in their own canvas under the (transparent) map canvas, so
+// the globe hides the ones behind it.  Real-sky statistics: many faint stars,
+// few bright ones, colours from blue-white to orange, and the Milky Way along
+// the galactic plane with its bright core toward Sagittarius.
+if (meta.global) {
+  document.body.classList.add("space");
+  const sky = document.getElementById("sky"), sctx = sky.getContext("2d");
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const gauss = () => Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd());
+  const unit = (ra, dec) => [Math.cos(dec) * Math.cos(ra), Math.cos(dec) * Math.sin(ra), Math.sin(dec)];
+  const D = Math.PI / 180;
+  // galactic frame in equatorial coordinates (J2000 north galactic pole and centre)
+  const GP = unit(192.859 * D, 27.128 * D), GC = unit(266.405 * D, -28.936 * D);
+  const GY = [GP[1] * GC[2] - GP[2] * GC[1], GP[2] * GC[0] - GP[0] * GC[2], GP[0] * GC[1] - GP[1] * GC[0]];
+  const gal = (l, b) => { const c = Math.cos(b), x = c * Math.cos(l), y = c * Math.sin(l), z = Math.sin(b);
+    return [0, 1, 2].map((i) => x * GC[i] + y * GY[i] + z * GP[i]); };
+  // star colours by spectral class, weighted like naked-eye stars
+  const TINTS = [["155,176,255", 0.05], ["170,191,255", 0.12], ["202,215,255", 0.2], ["248,247,255", 0.25],
+                 ["255,244,234", 0.18], ["255,221,180", 0.12], ["255,204,145", 0.08]];
+  const tint = () => { let u = rnd(); for (const [c, w] of TINTS) if ((u -= w) < 0) return c; return TINTS[3][0]; };
+  const stars = []; // [x, y, z, radius px, alpha, colour]
+  for (let i = 0; i < 6000; i++) { // field stars, uniform on the sphere
+    const z = rnd() * 2 - 1, a = rnd() * 2 * Math.PI, r = Math.sqrt(1 - z * z);
+    const m = rnd() ** 7; // brightness: a steep power law (few bright stars)
+    stars.push([r * Math.cos(a), r * Math.sin(a), z, 0.4 + 1.4 * m, Math.min(1, 0.12 + 0.2 * rnd() + 1.5 * m), tint()]);
+  }
+  for (let i = 0; i < 9000; i++) { // unresolved Milky Way stars, denser toward the core
+    const l = (rnd() < 0.35 ? gauss() * 0.6 : rnd() * 2 * Math.PI - Math.PI);
+    const b = gauss() * (0.05 + 0.05 * Math.exp(-l * l));
+    if (Math.abs(b + 0.01) < 0.012 && Math.abs(l) < 1.4 && rnd() < 0.7) continue; // the Great Rift (dust lane)
+    stars.push([...gal(l, b), 0.35 + rnd() * 0.3, 0.1 + rnd() * 0.3, rnd() < 0.5 ? "255,244,234" : "225,230,255"]);
+  }
+  const glow = []; // diffuse Milky Way light: many faint soft blobs along the plane
+  for (let i = 0; i < 1600; i++) {
+    const l = rnd() < 0.3 ? gauss() * 0.5 : rnd() * 2 * Math.PI - Math.PI;
+    const core = Math.exp(-l * l / 0.4);
+    const b = gauss() * (0.045 + 0.05 * core);
+    if (Math.abs(b + 0.01) < 0.015 && Math.abs(l) < 1.4 && rnd() < 0.6) continue; // dust lane
+    glow.push([...gal(l, b), 0.03 + 0.05 * rnd() + 0.03 * core, 0.006 + 0.014 * core + 0.004 * rnd(), core > 0.3 ? 1 : 0]);
+  }
+  const sprite = (inner, outer) => { // radial falloff
+    const c = document.createElement("canvas"); c.width = c.height = 64;
+    const g = c.getContext("2d"), rg = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    rg.addColorStop(0, `rgba(${inner},1)`); rg.addColorStop(0.45, `rgba(${outer},0.4)`); rg.addColorStop(1, `rgba(${outer},0)`);
+    g.fillStyle = rg; g.fillRect(0, 0, 64, 64); return c; };
+  const blobs = [sprite("205,212,240", "185,195,230"), sprite("255,236,205", "235,215,190")]; // disc, warmer core
+  const flare = document.createElement("canvas"); // bright-star halo
+  flare.width = flare.height = 32;
+  { const g = flare.getContext("2d"), rg = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+    rg.addColorStop(0, "rgba(255,255,255,0.7)"); rg.addColorStop(0.2, "rgba(255,255,255,0.15)"); rg.addColorStop(1, "rgba(255,255,255,0)");
+    g.fillStyle = rg; g.fillRect(0, 0, 32, 32); }
+
+  let queued = false;
+  const drawSky = () => {
+    queued = false;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2), W = sky.clientWidth, H = sky.clientHeight;
+    if (sky.width !== Math.round(W * dpr) || sky.height !== Math.round(H * dpr)) { sky.width = Math.round(W * dpr); sky.height = Math.round(H * dpr); }
+    sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    sctx.clearRect(0, 0, W, H);
+    if (map.getZoom() > 5.5) return; // the Earth fills the view
+    // camera looks at the map centre from space: forward = -up at the centre,
+    // right = local east, screen-up = local north (the map never rotates)
+    const c = map.getCenter(), lo = c.lng * D, la = c.lat * D;
+    const F = [-Math.cos(la) * Math.cos(lo), -Math.cos(la) * Math.sin(lo), -Math.sin(la)];
+    const R = [-Math.sin(lo), Math.cos(lo), 0];
+    const U = [-Math.sin(la) * Math.cos(lo), -Math.sin(la) * Math.sin(lo), Math.cos(la)];
+    const fov = (map.transform.fov ?? 36.87) * D, f = H / 2 / Math.tan(fov / 2), cx = W / 2, cy = H / 2;
+    const proj = (s) => { const w = s[0] * F[0] + s[1] * F[1] + s[2] * F[2];
+      if (w < 0.2) return null;
+      const x = cx + f * (s[0] * R[0] + s[1] * R[1] + s[2] * R[2]) / w, y = cy - f * (s[0] * U[0] + s[1] * U[1] + s[2] * U[2]) / w;
+      return x < -60 || y < -60 || x > W + 60 || y > H + 60 ? null : [x, y]; };
+    sctx.globalCompositeOperation = "lighter";
+    for (const g of glow) {
+      const p = proj(g); if (!p) continue;
+      const r = g[3] * f; sctx.globalAlpha = g[4];
+      sctx.drawImage(blobs[g[5]], p[0] - r, p[1] - r, 2 * r, 2 * r);
+    }
+    for (const s of stars) {
+      const p = proj(s); if (!p) continue;
+      const r = s[3];
+      sctx.globalAlpha = s[4];
+      if (r > 1.3) sctx.drawImage(flare, p[0] - 3 * r, p[1] - 3 * r, 6 * r, 6 * r);
+      sctx.fillStyle = `rgb(${s[5]})`;
+      if (r < 0.8) sctx.fillRect(p[0] - r, p[1] - r, 2 * r, 2 * r);
+      else { sctx.beginPath(); sctx.arc(p[0], p[1], r, 0, 2 * Math.PI); sctx.fill(); }
+    }
+    sctx.globalAlpha = 1; sctx.globalCompositeOperation = "source-over";
+  };
+  const queueSky = () => { if (!queued) { queued = true; requestAnimationFrame(drawSky); } };
+  map.on("move", queueSky); map.on("resize", queueSky); map.on("load", queueSky);
+  queueSky();
+}
 window.__live = { get frame() { return frame; }, cache, inflight, get shown() { return shown; }, stats, missing: 0, frames: 0 };
 const perfEl = document.getElementById("perf");
 
