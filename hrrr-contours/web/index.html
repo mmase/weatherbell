@@ -207,20 +207,18 @@ h1 { margin: 0; font: 700 20px/1.1 var(--ui); font-stretch: 78%; letter-spacing:
     while (packs.size > 48) packs.delete(packs.keys().next().value);
     return p;
   }
-  const EMPTY = new ArrayBuffer(0);
   maplibregl.addProtocol("hrrr", async (params) => {
     const [z, x, y] = params.url.slice(7).split("/").map(Number);
     const key = packKey(z, x, y);
-    if (!havePack.has(key)) return { data: EMPTY };
+    if (!havePack.has(key)) return { data: new ArrayBuffer(0) }; // fresh each time: MapLibre transfers (detaches) it
     const { buf, index } = await getPack(key);
     const e = index.get(`${z}/${x}/${y}`);
-    if (!e) return { data: EMPTY };
+    if (!e) return { data: new ArrayBuffer(0) }; // fresh each time: MapLibre transfers (detaches) it
     const stream = new Blob([new Uint8Array(buf, e[0], e[1])]).stream().pipeThrough(new DecompressionStream("gzip"));
     return { data: await new Response(stream).arrayBuffer() };
   });
   maplibregl.addProtocol("hrrrglyph", async (params) =>
     ({ data: await fetchBin(`glyphs/${decodeURIComponent(params.url.slice(12))}.pbf`) }));
-  ["2-0-0", "3-0-0", "4-0-0"].forEach((k) => havePack.has(k) && getPack(k)); // warm the overview packs
 
   // ---------------------------------------------------------------- style
   const css = () => { const s = getComputedStyle(document.documentElement); return (n) => s.getPropertyValue(n).trim(); };

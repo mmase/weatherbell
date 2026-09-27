@@ -12,7 +12,8 @@ Pipeline (per tile, per zoom):
          the kinked polylines you get from contouring the raw 3 km grid, and
          it is strictly local (4x4 support) so every tile computes bit-identical
          values for shared lattice points -> contours match across tile seams.
-       - downsampling (spacing >= 1 cell): light Gaussian prefilter + decimate.
+       - at low zooms the lattice is the native grid itself (never coarser),
+         so every model feature is kept.
   3. contourpy computes, for every integer degree t, the superlevel polygon
      {T >= t} (layer "levels", plus the data footprint in "base").  Painted in
      ascending t, these stack into 1-degree bands that cannot have gaps, and
@@ -39,7 +40,6 @@ import eccodes as ec
 import numpy as np
 import shapely
 from pyproj import Transformer
-from scipy.ndimage import gaussian_filter
 
 EXTENT = 8192
 BUFFER = 96  # tile units of overlap beyond the tile edge
@@ -118,14 +118,15 @@ class Field:
         self.F, self.proj, self.x0, self.y0, self.dx = load_field(path)
         self.ny, self.nx = self.F.shape
         self.Fp = np.pad(self.F, 2, mode="edge")
-        self.decimated = {}
         self.to_merc = WebMercator(self.proj, inverse=False)
         self.to_lcc = WebMercator(self.proj, inverse=True)
 
     def spacing(self, z):
         # ~1.6 px per lattice step at every zoom; the top zoom is twice as dense
         # because it is also what MapLibre overzooms (up to 16x) beyond z9.
-        return 1.0 / 32.0 if z == MAXZOOM else 2.0 ** (MAXZOOM - z) / 16.0
+        # Never coarser than the native 3 km grid, so no model feature is
+        # smoothed away at low zooms.
+        return 1.0 / 32.0 if z == MAXZOOM else min(1.0, 2.0 ** (MAXZOOM - z) / 16.0)
 
     def lattice(self, z, i0, i1, j0, j1):
         """Field values on the global lattice restricted to grid-index box."""
@@ -140,11 +141,8 @@ class Field:
             Wy, fy = keys_weights(uj, self.ny)
             sub = self.Fp[fy:fy + Wy.shape[1], fx:fx + Wx.shape[1]]
             Z = Wy @ sub @ Wx.T
-        else:
-            si = int(s)
-            if si not in self.decimated:
-                self.decimated[si] = gaussian_filter(self.F, 0.4 * si, mode="nearest")
-            Z = self.decimated[si][np.ix_(nj * si, ni * si)]
+        else:  # exactly the native grid: use the model values as-is
+            Z = self.F[np.ix_(nj, ni)]
         X = self.x0 + ui * self.dx
         Y = self.y0 + uj * self.dx
         return X, Y, Z

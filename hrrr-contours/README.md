@@ -26,13 +26,12 @@ vertex every 3 km. Instead, each tile evaluates the field on a finer **global
 lattice** in grid-index space using separable Keys bicubic convolution, then contours
 that lattice with `contourpy`:
 
-* The lattice step is about 1.6 screen px at every zoom: 8 cells at z2, 1/16 cell at z8,
-  and 1/32 cell (~94 m) at z9, which MapLibre overzooms up to z13.
+* The lattice step is about 1.6 screen px from z5 up (1 cell at z5, 1/16 cell at z8,
+  and 1/32 cell, ~94 m, at z9, which MapLibre overzooms up to z13). It is never coarser
+  than the native 3 km grid, so z2–z4 carry every model feature too.
 * Bicubic convolution is C¹-continuous, so the isotherms are tangent-continuous curves.
 * The kernel is local (4×4), and the lattice is global, so neighbouring tiles compute
   bit-identical values in their overlap. Contours meet exactly at tile seams.
-* Low zooms (lattice step ≥ 1 cell) use a light Gaussian prefilter and decimation. The
-  only features dropped are ones smaller than about a pixel.
 
 Nothing is simplified or dropped from the fill geometry at any zoom.
 
@@ -54,13 +53,13 @@ visible colour at any point is the colour of the band floor(T) to floor(T)+1:
 Tiles are gzipped and grouped into 364 pack files: one per zoom for z2–z4, per z5
 ancestor for z5–z6, and per z7 ancestor for z7–z9. The site is then just static files,
 with no range requests and no tile server. The client fetches a pack once, then slices
-and inflates tiles with `DecompressionStream`. The z2–z4 packs are prefetched. If
+and inflates tiles with `DecompressionStream`. If
 `meta.json` has `"encoding": "base64"`, the client fetches `.txt` base64 copies of the
 packs and glyphs instead, for hosts that only serve text.
 
 | zoom | tiles | avg tile (gz) |
 |---|---|---|
-| 2–4 | 16 | 50–100 KB |
+| 2–4 | 16 | 290–900 KB |
 | 5–6 | 122 | 75–120 KB |
 | 7–8 | 1567 | 23–48 KB |
 | 9 | 4754 | ~15 KB |
