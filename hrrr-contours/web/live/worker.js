@@ -28,7 +28,7 @@ self.onmessage = (e) => {
     const A = get(m.hA), B = m.hB == null ? null : get(m.hB);
     if (!A || (m.hB != null && !B)) { self.postMessage({ type: "tile", id: m.id, missing: true }); return; }
     const t0 = performance.now();
-    const r = contourTile(gridFor(k), B ? [A, B] : [A], m.w, m.z, m.x, m.y, m.spacing, m.allowCoarse);
+    const r = contourTile(gridFor(k), B ? [A, B] : [A], m.w, m.z, m.x, m.y, m.spacing, m.allowCoarse, m.sz ?? m.z);
     const ms = performance.now() - t0;
     if (!r) { self.postMessage({ type: "tile", id: m.id, empty: true, ms }); return; }
     // compact for upload: tile-local positions as uint16 (1/128 px at 512 px)

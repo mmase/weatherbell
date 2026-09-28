@@ -125,7 +125,7 @@ class Buf {
  * fields: [Int16Array] or [Int16Array, Int16Array] (values = degF * scale);
  * w: blend weight toward the second field (morphing between forecast hours).
  */
-export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse = false) {
+export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse = false, stepZ = z) {
   const { nx, ny } = grid, scale = grid.meta.scale;
   const tz = 2 ** z, tx0 = x / tz, ty0 = y / tz, ts = 1 / tz;
   const margin = ts / 64;
@@ -138,7 +138,9 @@ export function contourTile(grid, fields, w, z, x, y, spacingPx = 2, allowCoarse
       if (i < i0) i0 = i; if (i > i1) i1 = i; if (j < j0) j0 = j; if (j > j1) j1 = j;
     }
   }
-  const s = grid.step(z, spacingPx, allowCoarse);
+  // stepZ: the zoom the lattice density is chosen for (normally the tile's; the
+  // polar cap tiles are zoom-0 tiles above/below the world, drawn at any zoom)
+  const s = grid.step(stepZ, spacingPx, allowCoarse);
   const pad = 2 * s + 0.1 / grid.k; // in this level's nodes; the same window at every pyramid level
   const PER = grid.period; // global: columns wrap, so the window may run past either end
   const ni0 = PER ? Math.ceil((i0 - pad) / s) : Math.max(0, Math.ceil((i0 - pad) / s));

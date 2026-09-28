@@ -94,7 +94,9 @@ def main():
     if a.grid == "t1534":
         _, glats, gm = nat[0]
         d = gm["iDirectionIncrementInDegrees"]
-        k = int(np.ceil(85.2 / d))  # even rows from the equator, one past web mercator's 85.05
+        # even rows from the equator to ~89.5 deg (the globe shows the polar caps
+        # past web mercator's 85.05); a multiple of 4 so the pyramid levels divide
+        k = int(89.6 / d) // 4 * 4
         lats = d * np.arange(k, -k - 1, -1)  # north -> south, like the source
         fields = [(regrid_rows(v, gl, lats[::-1])[::-1], None) for v, gl, _ in nat]
     else:
@@ -103,7 +105,7 @@ def main():
         lats = gm["latitudeOfFirstGridPointInDegrees"] - d * np.arange(fields[0][0].shape[0])  # rows north -> south
     nx_g = fields[0][0].shape[1]
     lons = (gm["longitudeOfFirstGridPointInDegrees"] + d * np.arange(nx_g) + 180) % 360 - 180
-    rows = np.nonzero(np.abs(lats) <= 85.35)[0][::-1]  # south -> north
+    rows = np.nonzero(np.abs(lats) <= 89.6)[0][::-1]  # south -> north, to ~89.5 (the caps on the globe)
     cols = np.argsort(lons)
     cols = np.concatenate([cols, cols[:1]])  # repeat -180 as +180
     vmin, vmax = 1e9, -1e9

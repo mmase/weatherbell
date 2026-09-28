@@ -259,6 +259,10 @@ const fieldReady = new Map(); // "h@k" -> Int16Array, once loaded
 const MAIN_BUDGET = (navigator.deviceMemory && navigator.deviceMemory <= 4 ? 64 : 160) * 1e6;
 let readyBytes = 0;
 const POLAR_CAPS = !!meta.global && meta.proj.type === "latlon";
+// latitude of the grid's last row; when it reaches well into the polar caps
+// (past web mercator's 85.05 deg), the caps are contoured from the data itself
+const TOP_LAT = POLAR_CAPS ? Math.min(meta.y0 + (meta.ny - 1) * meta.dx, -meta.y0) : 0;
+const CAP_TILES = POLAR_CAPS && TOP_LAT > 88;
 const levelDims = (k) => [(NX - 1) / k + 1, (NY - 1) / k + 1];
 function field(h, k = 1) {
   const key = `${h}@${k}`;
@@ -309,7 +313,7 @@ for (let i = 0; i < NW; i++) {
   pool.push(entry);
 }
 async function contour(job) {
-  const k = levelFor(job.z, job.spacing, job.allowCoarse);
+  const k = levelFor(job.sz ?? job.z, job.spacing, job.allowCoarse);
   const need = [job.hA, job.hB].filter((h) => h != null);
   const data = await Promise.all(need.map((h) => field(h, k)));
   const e = pool.reduce((a, b) => (b.inflight < a.inflight ? b : a));
@@ -374,7 +378,18 @@ function visibleTiles(map, f) {
     out.push({ z, x: ((xw % n) + n) % n, xw, y, d: (xw + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 });
   out.sort((a, b) => a.d - b.d);
   const fk = frameKey(f);
-  return out.map((t) => ({ ...t, key: `${fk}|${t.z}/${t.x}/${t.y}` }));
+  return out.map((t) => ({ ...t, key: `${fk}|${t.z}/${t.x}/${t.y}` })).concat(capTiles(map, f));
+}
+
+// The polar caps (85.05 deg to the grid's last row) as two zoom-0 tiles just above
+// and below the world: MapLibre's globe maps them onto the caps.  Contoured like
+// any tile, with the lattice density of the current zoom (never finer than the
+// grid: a cap tile spans the whole circle of longitude, and the caps are small on
+// screen at the zooms that show them).
+function capTiles(map, f) {
+  if (!CAP_TILES || map.getZoom() > 7) return [];
+  const sz = Math.min(4, Math.max(0, Math.round(map.getZoom()))), fk = frameKey(f);
+  return [-1, 1].map((y) => ({ z: 0, x: 0, xw: 0, y, sz, key: `${fk}|cap${y}|${sz}` }));
 }
 
 const live = {
@@ -487,8 +502,11 @@ const live = {
       const mercY = (lat) => (1 - Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360)) / Math.PI) / 2 * 8192;
       // rings from the data edge to the pole, smoothed more toward the pole so the
       // columns don't converge into a pinwheel: [from lat, to lat, half-width in columns]
-      const edge = under ? 83 : 85.0511;
-      const RINGS = [[edge, 86, 0], [86, 87, 3], [87, 88, 10], [88, 88.8, 30], [88.8, 89.5, 90], [89.5, 90, Infinity]];
+      // grids that reach the caps (~89.5 deg) are contoured there by the cap tiles
+      // (capTiles); only the small disc past the last row is filled, with its mean
+      const edge = CAP_TILES ? TOP_LAT : under ? 83 : 85.0511;
+      const RINGS = CAP_TILES ? [[edge, 90, Infinity]]
+        : [[edge, 86, 0], [86, 87, 3], [87, 88, 10], [88, 88.8, 30], [88.8, 89.5, 90], [89.5, 90, Infinity]];
       const segs = N * 2 * RINGS.length;
       const pos = new Float32Array(segs * 8), band = new Int16Array(segs * 4), index = new Uint32Array(segs * 6);
       let v = 0, q = 0;
@@ -523,8 +541,38 @@ const live = {
     gl.bindVertexArray(null);
     gl.uniform1f(prog.cap, 0);
   },
+  // Static zoomed-out view (MapLibre's own tiles, device layer idle): the cap
+  // tiles still come from the device (see capTiles); when the device layer is
+  // active they are part of its tile list, so playback waits for them too.
+  drawCapTiles(gl, opts) {
+    if (this.active()) return;
+    const want = capTiles(this.map, playing ? frame : { ...frame, hB: null, w: 0 });
+    if (!want.length) return;
+    this.capShown ??= {};
+    const prog = this.useProgram(gl, opts);
+    for (const t of want) {
+      if (!cache.has(t.key) && !inflight.has(t.key)) {
+        inflight.add(t.key);
+        contour({ hA: frame.hA, hB: null, w: 0, z: 0, x: 0, y: t.y, sz: t.sz, spacing: frame.px, allowCoarse: true }).then((m) => {
+          inflight.delete(t.key);
+          if (!m.empty && !m.missing) this.upload(t.key, m, 0, 0, t.y);
+          else if (m.empty) cache.set(t.key, { count: 0, bytes: 0, used: performance.now(), z: 0, x: 0, y: t.y });
+          this.map.triggerRepaint();
+        });
+      }
+      if (cache.has(t.key)) this.capShown[t.y] = t.key; // else keep drawing the last one
+      const c = cache.get(this.capShown[t.y]);
+      if (!c || !c.count) continue;
+      c.used = performance.now();
+      this.setTile(prog, 0, 0, t.y, 0);
+      gl.bindVertexArray(c.vao);
+      gl.drawElements(gl.TRIANGLES, c.count, gl.UNSIGNED_INT, 0);
+    }
+    gl.bindVertexArray(null);
+  },
   render(gl, opts) {
     this.drawCaps(gl, opts);
+    this.drawCapTiles(gl, opts);
     if (!this.active()) return;
     const map = this.map, f = frame;
     const want = visibleTiles(map, f);
@@ -534,7 +582,7 @@ const live = {
       if (inflight.has(t.key) || inflight.size >= NW * 2) continue;
       inflight.add(t.key);
       const t0 = performance.now();
-      contour({ hA: f.hA, hB: f.hB, w: f.w, z: t.z, x: t.x, y: t.y, spacing: f.px, allowCoarse: f.coarse }).then((m) => {
+      contour({ hA: f.hA, hB: f.hB, w: f.w, z: t.z, x: t.x, y: t.y, sz: t.sz, spacing: f.px, allowCoarse: t.sz != null || f.coarse }).then((m) => {
         inflight.delete(t.key);
         if (!m.empty && !m.missing) {
           this.upload(t.key, m, t.z, t.x, t.y);
@@ -563,7 +611,7 @@ const live = {
       gl.drawElements(gl.TRIANGLES, t.count, gl.UNSIGNED_INT, 0);
     }
     gl.bindVertexArray(null);
-    const keep = new Set([...draw.map((d) => d.key), ...want.map((t) => t.key)]);
+    const keep = new Set([...draw.map((d) => d.key), ...want.map((t) => t.key), ...Object.values(this.capShown || {})]);
     if (playing) this.drop((k) => !keep.has(k)); // frames already played are never reused
     this.evict(keep);
     if (!playing && ready < want.length) map.triggerRepaint();
